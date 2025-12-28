@@ -158,7 +158,7 @@ class TuckerFactor(nn.Module):
             else:
                 U = self.U
         return U
-    
+
     def get(self, target):
         if self.chunked:
             chunk_idx = target // self.max_chunk_size
@@ -214,7 +214,7 @@ class ComplexTucker(RealTucker):
         self.G = None  # override parent
         self.G_real = nn.Parameter(torch.randn(self.rH, self.rW, self.rC, self.rT, device=device) * 1e-2)
         self.G_imag = nn.Parameter(torch.zeros(self.rH, self.rW, self.rC, self.rT, device=device))
-    
+
     def forward(self, t):
         UH = self.UH()
         UW = self.UW()
@@ -340,6 +340,7 @@ class BasicUpres(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
+        self.inputs = x
         upres_kernel = self.upres(x)
         return upres_kernel
 
@@ -401,7 +402,7 @@ class NikaBlock(nn.Module):
         core_input = self.groupnorm(normed_input)
         refined = self.upres(core_input)
         return refined
-            
+
     def test_images(self, output_dir):
         self.eval()
         with torch.no_grad():
@@ -448,7 +449,7 @@ def feature_test(vid, device):
 
     opt = SOAP(list(model.parameters()), lr=1e-2)
 
-    for epoch in range(2000):
+    for epoch in range(300):
         opt.zero_grad(set_to_none=True)
         loss = 0.0
         start_time = time.time()
@@ -471,8 +472,64 @@ def feature_test(vid, device):
             print(f"Epoch {epoch}: Tucker PSNR: {batch_psnr:.2f}")
             model.test_images("out_feature_test")
 
+    torch.save(model.state_dict(), "models/beauty-model.torch")
+
+
+def explain(vid, device):
+    from torch.autograd import grad
+    batch_size = 1
+
+    # reference sizes
+    # 3.3M config
+    small_grid_ranks = [2, 60, 70, 120]  # 1M params
+    small_real_tucker = [2, 80, 80, 80]  # 1.1M params
+    small_complex_tucker = [2, 60, 60, 60]  # 1M params
+    small_hidden = 150  # 0.1M params
+
+    model = NikaBlock(
+        target_shape=[3, vid.shape[2], vid.shape[3], vid.shape[0]],
+        k=4,
+        real_tucker_ranks=small_real_tucker,
+        complex_tucker_ranks=small_complex_tucker,
+        grid_ranks=small_grid_ranks,
+        conv_hidden=small_hidden,
+        out_channels=3,
+        device=device,
+    )
+    model.load_state_dict(torch.load("models/beauty-model.torch"))
+    model.eval()
+
+    opt = SOAP(list(model.parameters()), lr=1e-2)
+
+    opt.zero_grad(set_to_none=True)
+    loss = 0.0
+    start_time = time.time()
+
+    def rescale(img):
+        rescaled = (img - img.min()) / (img.max() - img.min())
+        return rescaled
+
+    for t in range(vid.shape[0] // batch_size):
+        min_t = t * batch_size; max_t = (t + 1) * batch_size
+        batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
+        t_batch = torch.linspace(min_t, max_t - 1, steps=(max_t - min_t), dtype=torch.int64, device=device)
+        prediction = model(t_batch)
+        pixel_sum = prediction.sum()
+        upres_input_grad = grad(pixel_sum, model.upres.inputs)[0]
+        for i in range(9):
+            save_image(rescale(upres_input_grad[0,i,...]), f"visuals/frame0_channel{i}.png")
+            save_image(rescale(upres_input_grad[0,i,...].abs()), f"visuals/frame0_channel{i}_abs.png")
+        save_image(rescale(upres_input_grad[0,:3,...]), "visuals/real_branch_frame0.png")
+        save_image(rescale(upres_input_grad[0,3:6,...]), "visuals/imaginary_branch_frame0.png")
+        save_image(rescale(upres_input_grad[0,6:,...]), "visuals/feature_grid_branch_frame0.png")
+        save_image(rescale(upres_input_grad[0,:3,...].abs()), "visuals/real_branch_abs_frame0.png")
+        save_image(rescale(upres_input_grad[0,3:6,...].abs()), "visuals/imaginary_branch_abs_frame0.png")
+        save_image(rescale(upres_input_grad[0,6:,...].abs()), "visuals/feature_grid_branch_abs_frame0.png")
+        import pdb; pdb.set_trace()
+
 
 if __name__ == "__main__":
     device = "cuda:0"
-    vid = load_video_frames("static/benchmarks/uvg/beauty", device, max_frames=600, dtype=torch.uint8, normalize=False)
-    feature_test(vid, device=device)
+    vid = load_video_frames("static/Beauty", device, max_frames=50, dtype=torch.uint8, normalize=False)
+    explain(vid, device=device)
+    # feature_test(vid, device=device)
