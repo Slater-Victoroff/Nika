@@ -1,0 +1,127 @@
+import torch
+import torch.nn.functional as F
+from torchvision.utils import save_image
+
+from load_data import load_video_frames
+from nika import NikaBlock
+from soap import SOAP
+from configs import REFERENCES
+
+def benchmark_psnr(name, config, device):
+    vid = load_video_frames(f"static/benchmarks/bunny", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    model = NikaBlock(
+        target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
+        k=4,
+        **REFERENCES[config],
+        out_channels=3,
+        device=device,
+    )
+    state_dict = torch.load("models/xxs-bunny-epoch1934-psnr31.05.torch")
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print(f"Model loaded. Missing keys: {missing}, Unexpected keys: {unexpected}")
+    print(f"Model parameter count: {sum(p.numel() for p in model.parameters())}")
+    model.eval()
+    total_psnr = 0.0
+    num_frames = vid.shape[0]
+
+    batch_size = 10  # You can adjust this as needed
+    num_batches = (num_frames + batch_size - 1) // batch_size
+    with torch.no_grad():
+        for batch_idx in range(num_batches):
+            min_t = batch_idx * batch_size
+            max_t = min((batch_idx + 1) * batch_size, num_frames)
+            batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
+            t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
+            prediction = model(t_batch)
+            for i in range(prediction.shape[0]):
+                save_image(prediction[i], f"visuals/{name}_frame{min_t + i:03d}.png")
+                mse = F.mse_loss(prediction[i].clamp(0, 1), batch_gt[i])
+                psnr = 10 * torch.log10(1 / (mse + 1e-8))
+                total_psnr += psnr.item()
+                if (min_t + i) % 100 == 0:
+                    print(f"Processed frame {min_t + i}, PSNR: {psnr:.4f}")
+
+    avg_psnr = total_psnr / num_frames
+    print(f"Average PSNR: {avg_psnr:.4f}")
+
+
+def explain(vid, device):
+    from torch.autograd import grad
+    batch_size = 1
+
+    # reference sizes
+    # 3.3M config
+    small_grid_ranks = [2, 60, 70, 120]  # 1M params
+    small_real_tucker = [2, 80, 80, 80]  # 1.1M params
+    small_complex_tucker = [2, 60, 60, 60]  # 1M params
+    small_hidden = 150  # 0.1M params
+
+    model = NikaBlock(
+        target_shape=[3, vid.shape[2], vid.shape[3], vid.shape[0]],
+        k=4,
+        real_tucker_ranks=small_real_tucker,
+        complex_tucker_ranks=small_complex_tucker,
+        grid_ranks=small_grid_ranks,
+        conv_hidden=small_hidden,
+        out_channels=3,
+        device=device,
+    )
+    model.load_state_dict(torch.load("models/beauty-model.torch"))
+    model.eval()
+
+    opt = SOAP(list(model.parameters()), lr=1e-2)
+
+    opt.zero_grad(set_to_none=True)
+    loss = 0.0
+    start_time = time.time()
+
+    def rescale(img):
+        rescaled = (img - img.min()) / (img.max() - img.min())
+        return rescaled
+
+    for t in range(vid.shape[0] // batch_size):
+        min_t = t * batch_size; max_t = (t + 1) * batch_size
+        batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
+        t_batch = torch.linspace(min_t, max_t - 1, steps=(max_t - min_t), dtype=torch.int64, device=device)
+        prediction = model(t_batch)
+        pixel_sum = prediction.sum()
+        upres_input_grad = grad(pixel_sum, model.upres.inputs)[0]
+        contributions = upres_input_grad.abs().mean(dim=(2, 3))
+        print(contributions)
+        absed = []
+        for i in range(9):
+            save_image(rescale(upres_input_grad[0,i,...]), f"visuals/frame0_channel{i}.png")
+            abs_i = rescale(upres_input_grad[0,i,...]).abs()
+            save_image(abs_i, f"visuals/frame0_channel{i}_abs.png")
+            absed.append(abs_i)
+
+        intensities = []
+        for start in range(0, 9, 3):
+            combined = torch.stack(absed[start:start+3], axis=0)
+            intensity = combined.norm(dim=0)
+            intensities.append(intensity)
+            intensity = intensity / intensity.max()
+            names = {
+                0: 'real',
+                3: 'imaginary',
+                6: 'feature_grid'
+            }
+            save_image(combined, f"visuals/{names[start]}_independent_norm.png")
+            save_image(intensity, f"visuals/{names[start]}_intensity.png")
+
+        save_image(rescale(torch.stack(intensities, axis=0)), "visuals/merge_all_the_things.png")
+        save_image(rescale(upres_input_grad[0,:3,...]), "visuals/real_branch_frame0.png")
+        save_image(rescale(upres_input_grad[0,3:6,...]), "visuals/imaginary_branch_frame0.png")
+        save_image(rescale(upres_input_grad[0,6:,...]), "visuals/feature_grid_branch_frame0.png")
+        save_image(rescale(upres_input_grad[0,:3,...]).abs(), "visuals/real_branch_abs_frame0.png")
+        save_image(rescale(upres_input_grad[0,3:6,...]).abs(), "visuals/imaginary_branch_abs_frame0.png")
+        save_image(rescale(upres_input_grad[0,6:,...]).abs(), "visuals/feature_grid_branch_abs_frame0.png")
+        import pdb; pdb.set_trace()
+
+
+if __name__ == "__main__":
+    device = "cuda:0"
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    benchmark_psnr("beauty", "xxs", device)
