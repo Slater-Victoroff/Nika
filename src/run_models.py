@@ -15,6 +15,7 @@ import subprocess
 
 def get_best_model(model_dir, vid_shape, vid_name, config, device):
     all_models = glob.glob(f"{model_dir}/{config}-{vid_name}-*.torch")
+    print(all_models)
     if not all_models:
         raise ValueError(f"No models found for {vid_name} with config {config}")
 
