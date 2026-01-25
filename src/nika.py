@@ -276,13 +276,6 @@ class BasicUpres(nn.Module):
         ])
         self.upres = nn.Sequential(*self.layers).to(device)
 
-        # # xavier init
-        # for m in self.upres.modules():
-        #     if isinstance(m, nn.Conv2d):
-        #         nn.init.xavier_uniform_(m.weight)
-        #         if m.bias is not None:
-        #             nn.init.zeros_(m.bias)
-
         #kaiming init
         for m in self.upres.modules():
             if isinstance(m, nn.Conv2d):
@@ -439,11 +432,11 @@ def feature_test(vid, name, config, device):
 
 if __name__ == "__main__":
     device = "cuda:1"
-    name = "jockey"
-    vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    name = "bunny"
+    vid = load_video_frames(f"static/benchmarks/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     # explain(vid, device=device)
-    feature_test(vid, name, "small", device=device)
+    feature_test(vid, name, "xxs", device=device)
     # batch_profile(vid, device=device, batch_sizes=(1, 5, 10), iters=10, warmup=5)

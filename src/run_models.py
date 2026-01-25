@@ -1,6 +1,9 @@
+import os
+import time
 import torch
 import torch.nn.functional as F
 from torchvision.utils import save_image
+from torch.autograd import grad
 
 import re
 import glob
@@ -8,8 +11,9 @@ from load_data import load_video_frames
 from nika import NikaBlock
 from soap import SOAP
 from configs import REFERENCES
+import subprocess
 
-def get_best_model(model_dir, vid_shape, vid_name, config):
+def get_best_model(model_dir, vid_shape, vid_name, config, device):
     all_models = glob.glob(f"{model_dir}/{config}-{vid_name}-*.torch")
     if not all_models:
         raise ValueError(f"No models found for {vid_name} with config {config}")
@@ -22,7 +26,7 @@ def get_best_model(model_dir, vid_shape, vid_name, config):
         raise ValueError(f"Could not extract PSNR from filename: {filename}")
     all_models.sort(key=extract_psnr)
 
-    print(f"Best model for {vid_name} with config {config}: {all_models[-2]}")
+    print(f"Best model for {vid_name} with config {config}: {all_models[-1]}")
     model = NikaBlock(
         target_shape=[4, vid_shape[2], vid_shape[3], vid_shape[0]],
         k=4,
@@ -30,13 +34,16 @@ def get_best_model(model_dir, vid_shape, vid_name, config):
         out_channels=3,
         device=device,
     )
-    state_dict = torch.load(all_models[-2])
+    state_dict = torch.load(all_models[-1], map_location=device)
     model.load_state_dict(state_dict)
     return model
 
+
 def benchmark_psnr(basedir, vid_name, config, device):
     vid = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
-    model = get_best_model("models", vid.shape, vid_name, config)
+    model = get_best_model("models", vid.shape, vid_name, config, device)
+    os.makedirs(f"visuals/{vid_name}/{config}/preds", exist_ok=True)
+    os.makedirs(f"visuals/{vid_name}/{config}/residual", exist_ok=True)
     model.eval()
     total_psnr = 0.0
     num_frames = vid.shape[0]
@@ -50,8 +57,17 @@ def benchmark_psnr(basedir, vid_name, config, device):
             batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
             t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
             prediction = model(t_batch)
+            residual = prediction - batch_gt
+            residual_max = residual.max(); residual_min = residual.min()
             for i in range(prediction.shape[0]):
-                save_image(prediction[i], f"visuals/{vid_name}_frame{min_t + i:03d}.png")
+                save_image(prediction[i], f"visuals/{vid_name}/{config}/preds/pred_frame{min_t + i:03d}.png")
+                # Map residual to [0, 1] by normalizing to its min/max per-frame
+                res = residual[i]
+                if (residual_max - residual_min) > 1e-8:
+                    res_norm = (res - residual_min) / (residual_max - residual_min)
+                else:
+                    res_norm = torch.zeros_like(res)
+                save_image(res_norm, f"visuals/{vid_name}/{config}/residual/residual_frame{min_t + i:03d}.png")
                 mse = F.mse_loss(prediction[i].clamp(0, 1), batch_gt[i])
                 psnr = 10 * torch.log10(1 / (mse + 1e-8))
                 total_psnr += psnr.item()
@@ -61,10 +77,38 @@ def benchmark_psnr(basedir, vid_name, config, device):
     avg_psnr = total_psnr / num_frames
     print(f"Average PSNR: {avg_psnr:.4f}")
 
+    # Timing run
+    if "cuda" in device:
+        torch.cuda.synchronize(device)
+    start_time = time.time()
+    with torch.no_grad():
+        for batch_idx in range(num_batches):
+            min_t = batch_idx * batch_size
+            max_t = min((batch_idx + 1) * batch_size, num_frames)
+            t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
+            _ = model(t_batch)
+    if "cuda" in device:
+        torch.cuda.synchronize(device)
+    end_time = time.time()
+    print(f"Timing run took {end_time - start_time:.4f} seconds")
+
+
+def make_mp4(png_frame_dir, output_path="output.mp4", base_name="pred_frame", fps=24):
+    # Assumes frames are named in order: frame000.png, frame001.png, ...
+    input_pattern = os.path.join(png_frame_dir, f"{base_name}%03d.png")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-framerate", str(fps),
+        "-i", input_pattern,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        output_path
+    ]
+    subprocess.run(cmd, check=True)
 
 def explain(vid, device):
-    from torch.autograd import grad
-    batch_size = 1
+    batch_size = 50
 
     # reference sizes
     # 3.3M config
@@ -138,7 +182,11 @@ def explain(vid, device):
 
 if __name__ == "__main__":
     device = "cuda:0"
+    name = "bunny"
+    config = "xxs"
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    benchmark_psnr("static/benchmarks", "bunny", "xs", device)
+    benchmark_psnr("static/benchmarks", name, config, device)
+    make_mp4(f"visuals/{name}/{config}/preds", output_path=f"visuals/{name}/{config}/preds/output.mp4", base_name="pred_frame", fps=24)
+    make_mp4(f"visuals/{name}/{config}/residual", output_path=f"visuals/{name}/{config}/residual/output.mp4", base_name="residual_frame", fps=24)
