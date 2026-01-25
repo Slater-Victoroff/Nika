@@ -282,7 +282,7 @@ class FactorizedCore(nn.Module):
         return cp_construct(UT, UC, UH, UW).contiguous()
 
 class BasicUpres(nn.Module):
-    def __init__(self, in_channels, out_channels, hidden, k, blocks, device='cuda'):
+    def __init__(self, in_channels, out_channels, hidden, k, device='cuda'):
         super().__init__()
         half_k = k // 2
         self.k = k
@@ -326,7 +326,7 @@ class BasicUpres(nn.Module):
 
 
 class NikaBlock(nn.Module):
-    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, conv_hidden, upres_blocks, out_channels, device):
+    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, conv_hidden, out_channels, device):
         super().__init__()
         self.C, self.H, self.W, self.T = target_shape
         self.H = int(self.H // k); self.W = int(self.W // k)
@@ -357,7 +357,6 @@ class NikaBlock(nn.Module):
             out_channels=out_channels,
             hidden=conv_hidden,
             k=k,
-            blocks=upres_blocks,
             device=device,
         ).to(device)
 
