@@ -206,3 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 static/
+
+# Generated visuals (large MP4s)
+src/visuals/
