@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nika - Neural Implicit Video Representations</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <header class="hero">
+        <div class="hero-content">
+            <h1>Nika</h1>
+            <p class="subtitle">Neural Implicit Video Representations</p>
+            <p class="description">
+                Exploring neural network-based video compression using implicit representations.
+                Each model learns to encode a video as network weights, enabling reconstruction
+                at arbitrary resolutions and frame rates.
+            </p>
+        </div>
+    </header>
+
+    <main class="container">
+        <section class="gallery">
+            <h2>Model Gallery</h2>
+            <p class="gallery-intro">
+                Select a video to explore its reconstruction quality, error analysis, and side-by-side comparisons.
+            </p>
+
+            <div class="card-grid">
+                <a href="videos/beauty.html" class="card">
+                    <div class="card-image">
+                        <img src="assets/plots/small_beauty_spatial_heatmap.png" alt="Beauty spatial heatmap">
+                    </div>
+                    <div class="card-content">
+                        <h3>Beauty</h3>
+                        <span class="psnr-badge">PSNR: 33.31 dB</span>
+                        <div class="card-meta">
+                            <span>Config: small</span>
+                            <span>Epochs: 1992</span>
+                        </div>
+                    </div>
+                </a>
+
+                <a href="videos/bosphorus.html" class="card">
+                    <div class="card-image">
+                        <img src="assets/plots/small_bosphorus_spatial_heatmap.png" alt="Bosphorus spatial heatmap">
+                    </div>
+                    <div class="card-content">
+                        <h3>Bosphorus</h3>
+                        <span class="psnr-badge">PSNR: 33.74 dB</span>
+                        <div class="card-meta">
+                            <span>Config: small</span>
+                            <span>Epochs: 1958</span>
+                        </div>
+                    </div>
+                </a>
+
+                <a href="videos/honey.html" class="card">
+                    <div class="card-image">
+                        <img src="assets/plots/small_honey_spatial_heatmap.png" alt="Honey spatial heatmap">
+                    </div>
+                    <div class="card-content">
+                        <h3>Honey</h3>
+                        <span class="psnr-badge">PSNR: 37.12 dB</span>
+                        <div class="card-meta">
+                            <span>Config: small</span>
+                            <span>Epochs: 1915</span>
+                        </div>
+                    </div>
+                </a>
+
+                <a href="videos/jockey.html" class="card">
+                    <div class="card-image">
+                        <img src="assets/plots/small_jockey_spatial_heatmap.png" alt="Jockey spatial heatmap">
+                    </div>
+                    <div class="card-content">
+                        <h3>Jockey</h3>
+                        <span class="psnr-badge">PSNR: 31.81 dB</span>
+                        <div class="card-meta">
+                            <span>Config: small</span>
+                            <span>Epochs: 1982</span>
+                        </div>
+                    </div>
+                </a>
+
+                <a href="videos/ready.html" class="card">
+                    <div class="card-image">
+                        <img src="assets/plots/small_ready_spatial_heatmap.png" alt="Ready spatial heatmap">
+                    </div>
+                    <div class="card-content">
+                        <h3>Ready</h3>
+                        <span class="psnr-badge">PSNR: 25.38 dB</span>
+                        <div class="card-meta">
+                            <span>Config: small</span>
+                            <span>Epochs: 1992</span>
+                        </div>
+                    </div>
+                </a>
+
+                <a href="videos/shake.html" class="card">
+                    <div class="card-image">
+                        <img src="assets/plots/small_shake_spatial_heatmap.png" alt="Shake spatial heatmap">
+                    </div>
+                    <div class="card-content">
+                        <h3>Shake</h3>
+                        <span class="psnr-badge">PSNR: 33.55 dB</span>
+                        <div class="card-meta">
+                            <span>Config: small</span>
+                            <span>Epochs: 1991</span>
+                        </div>
+                    </div>
+                </a>
+
+                <a href="videos/yacht.html" class="card">
+                    <div class="card-image">
+                        <img src="assets/plots/small_yacht_spatial_heatmap.png" alt="Yacht spatial heatmap">
+                    </div>
+                    <div class="card-content">
+                        <h3>Yacht</h3>
+                        <span class="psnr-badge">PSNR: 28.55 dB</span>
+                        <div class="card-meta">
+                            <span>Config: small</span>
+                            <span>Epochs: 1912</span>
+                        </div>
+                    </div>
+                </a>
+            </div>
+        </section>
+
+        <section class="about">
+            <h2>About This Project</h2>
+            <p>
+                Nika uses neural implicit representations to encode videos as the weights of a neural network.
+                Instead of storing pixel data directly, the network learns a continuous function that maps
+                (x, y, t) coordinates to RGB values. This approach enables:
+            </p>
+            <ul>
+                <li><strong>Compact representation</strong> - Video stored as network weights</li>
+                <li><strong>Arbitrary resolution</strong> - Query any coordinate, not just pixel grid</li>
+                <li><strong>Temporal interpolation</strong> - Generate frames between original timestamps</li>
+            </ul>
+            <p>
+                The visualizations show reconstruction quality metrics including PSNR (Peak Signal-to-Noise Ratio),
+                spatial error heatmaps showing where the model struggles, and side-by-side comparisons with ground truth.
+            </p>
+        </section>
+    </main>
+
+    <footer>
+        <p>Nika - Neural Implicit Video Representations</p>
+    </footer>
+
+    <script src="js/main.js"></script>
+</body>
+</html>

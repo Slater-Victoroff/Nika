@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Yacht - Nika</title>
+    <link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+    <main class="container">
+        <a href="../index.html" class="back-link">&larr; Back to Gallery</a>
+
+        <div class="detail-header">
+            <h1>Yacht</h1>
+            <span class="psnr-badge">PSNR: 28.55 dB</span>
+        </div>
+
+        <section class="video-section">
+            <div class="video-container">
+                <video controls preload="metadata">
+                    <source src="../assets/videos/small_yacht_comparison.mp4" type="video/mp4">
+                    Your browser does not support the video tag.
+                </video>
+                <p class="video-caption">
+                    Side-by-side comparison: Ground Truth | Neural Reconstruction | Residual Error
+                </p>
+            </div>
+        </section>
+
+        <section class="tabs">
+            <div class="tab-buttons">
+                <button class="tab-button active" data-tab="error-time">Error Over Time</button>
+                <button class="tab-button" data-tab="spatial">Spatial Heatmap</button>
+            </div>
+
+            <div class="tab-content active" id="error-time">
+                <div class="tab-panel">
+                    <img src="../assets/plots/small_yacht_error_over_time.png"
+                         alt="Yacht error over time"
+                         class="lightbox-trigger">
+                    <p>PSNR and MSE metrics plotted across all video frames. Higher PSNR indicates better reconstruction quality.</p>
+                </div>
+            </div>
+
+            <div class="tab-content" id="spatial">
+                <div class="tab-panel">
+                    <img src="../assets/plots/small_yacht_spatial_heatmap.png"
+                         alt="Yacht spatial heatmap"
+                         class="lightbox-trigger">
+                    <p>Spatial distribution of reconstruction error. Brighter regions indicate higher error concentrations.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="metadata-grid">
+            <div class="metadata-item">
+                <div class="metadata-label">PSNR</div>
+                <div class="metadata-value">28.55 dB</div>
+            </div>
+            <div class="metadata-item">
+                <div class="metadata-label">Config</div>
+                <div class="metadata-value">small</div>
+            </div>
+            <div class="metadata-item">
+                <div class="metadata-label">Epochs</div>
+                <div class="metadata-value">1912</div>
+            </div>
+        </section>
+
+        <nav class="video-nav">
+            <a href="shake.html" class="nav-link">&larr; Shake</a>
+            <a href="beauty.html" class="nav-link">Beauty &rarr;</a>
+        </nav>
+    </main>
+
+    <div class="lightbox" id="lightbox">
+        <button class="lightbox-close">&times;</button>
+        <img src="" alt="Enlarged view">
+    </div>
+
+    <footer>
+        <p>Nika - Neural Implicit Video Representations</p>
+    </footer>
+
+    <script src="../js/main.js"></script>
+</body>
+</html>
