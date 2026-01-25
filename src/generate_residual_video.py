@@ -28,7 +28,7 @@ import torch
 from configs import REFERENCES
 from load_data import load_video_frames
 from nika import NikaBlock
-from visualize_errors import parse_model_filename
+from visualize_errors import parse_model_filename, VIDEO_NAME_MAP
 
 
 def load_model(path: str, vid_shape: tuple, config: str, device: str) -> NikaBlock:
@@ -259,8 +259,11 @@ def main():
     config, video_name = parse_model_filename(args.model_path)
     print(f"Config: {config}, Video: {video_name}")
 
+    # Map abbreviated video names to actual folder names
+    folder_name = VIDEO_NAME_MAP.get(video_name, video_name)
+
     # Load video
-    video_path = os.path.join(args.video_dir, video_name)
+    video_path = os.path.join(args.video_dir, folder_name)
     print(f"Loading video from {video_path}...")
 
     video = load_video_frames(

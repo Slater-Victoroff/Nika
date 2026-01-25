@@ -60,6 +60,15 @@ from configs import REFERENCES
 from load_data import load_video_frames
 from nika import NikaBlock
 
+# Mapping from model video names to actual folder names
+VIDEO_NAME_MAP = {
+    "honey": "HoneyBee",
+    "jockey": "Jockey",
+    "ready": "ReadySteadyGo",
+    "shake": "ShakeNDry",
+    "yacht": "YachtRide",
+}
+
 
 # =============================================================================
 # FILENAME PARSING
@@ -603,9 +612,12 @@ def main():
     # LOAD VIDEO
     # -------------------------------------------------------------------------
 
+    # Map abbreviated video names to actual folder names
+    folder_name = VIDEO_NAME_MAP.get(video_name, video_name)
+
     # Construct path to video frames directory
     # Videos are stored as directories of PNG frames: {video_dir}/{video_name}/*.png
-    video_path = os.path.join(args.video_dir, video_name)
+    video_path = os.path.join(args.video_dir, folder_name)
     print(f"Loading video from {video_path}...")
 
     # Load video frames into a tensor
