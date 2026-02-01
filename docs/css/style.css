@@ -271,6 +271,114 @@ footer {
     border-top: 1px solid var(--border);
 }
 
+/* Ablation Pages */
+.ablation-intro {
+    margin-bottom: 1.5rem;
+    color: var(--text-secondary);
+}
+
+.ablation-grid {
+    display: grid;
+    gap: 1.5rem;
+}
+
+.ablation-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.ablation-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1rem 1.25rem 0.5rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.ablation-card-header h2 {
+    margin: 0;
+    font-size: 1.1rem;
+}
+
+.ablation-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    padding: 0.5rem 1.25rem 1rem;
+    font-size: 0.875rem;
+    color: var(--text-muted);
+}
+
+.ablation-video video {
+    width: 100%;
+    display: block;
+}
+
+.ablation-plots {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 1rem;
+    padding: 1rem 1.25rem 1.5rem;
+    border-top: 1px solid var(--border);
+    background: var(--bg-secondary);
+}
+
+.ablation-plot img {
+    width: 100%;
+    height: auto;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: opacity var(--transition);
+}
+
+.ablation-plot img:hover {
+    opacity: 0.9;
+}
+
+.ablation-plot p {
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+/* Model Selector */
+.model-selector {
+    margin-bottom: 1.5rem;
+}
+
+.model-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.model-button {
+    padding: 0.5rem 1rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+    cursor: pointer;
+    transition: background var(--transition), color var(--transition), border-color var(--transition);
+}
+
+.model-button:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border-color: var(--text-muted);
+}
+
+.model-button.active {
+    background: var(--accent);
+    color: var(--bg-primary);
+    border-color: var(--accent);
+    font-weight: 500;
+}
+
 /* Tabs */
 .tabs {
     margin-bottom: 2rem;
@@ -472,6 +580,11 @@ footer {
     }
 
     .detail-header {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .ablation-card-header {
         flex-direction: column;
         align-items: flex-start;
     }

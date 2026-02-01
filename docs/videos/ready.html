@@ -12,12 +12,22 @@
 
         <div class="detail-header">
             <h1>Ready</h1>
-            <span class="psnr-badge">PSNR: 25.38 dB</span>
+            <span class="psnr-badge" id="psnr-display">25.38 dB</span>
         </div>
+
+        <section class="model-selector">
+            <div class="model-buttons">
+                <button class="model-button active" data-model="small">small (baseline)</button>
+                <button class="model-button" data-model="tucker-small">tucker-small</button>
+                <button class="model-button" data-model="real-small">real-small</button>
+                <button class="model-button" data-model="weird-nika">weird-nika</button>
+                <button class="model-button" data-model="noconv-nika">noconv-nika</button>
+            </div>
+        </section>
 
         <section class="video-section">
             <div class="video-container">
-                <video controls preload="metadata">
+                <video controls preload="metadata" id="comparison-video">
                     <source src="https://nikanet.com/videos/small_ready_comparison.mp4" type="video/mp4">
                     Your browser does not support the video tag.
                 </video>
@@ -37,6 +47,7 @@
                 <div class="tab-panel">
                     <img src="https://nikanet.com/plots/small_ready_error_over_time.png"
                          alt="Ready error over time"
+                         id="error-time-img"
                          class="lightbox-trigger">
                     <p>PSNR and MSE metrics plotted across all video frames. Higher PSNR indicates better reconstruction quality.</p>
                 </div>
@@ -46,6 +57,7 @@
                 <div class="tab-panel">
                     <img src="https://nikanet.com/plots/small_ready_spatial_heatmap.png"
                          alt="Ready spatial heatmap"
+                         id="spatial-img"
                          class="lightbox-trigger">
                     <p>Spatial distribution of reconstruction error. Brighter regions indicate higher error concentrations.</p>
                 </div>
@@ -55,15 +67,15 @@
         <section class="metadata-grid">
             <div class="metadata-item">
                 <div class="metadata-label">PSNR</div>
-                <div class="metadata-value">25.38 dB</div>
+                <div class="metadata-value" id="meta-psnr">25.38 dB</div>
             </div>
             <div class="metadata-item">
                 <div class="metadata-label">Config</div>
-                <div class="metadata-value">small</div>
+                <div class="metadata-value" id="meta-config">small</div>
             </div>
             <div class="metadata-item">
                 <div class="metadata-label">Epochs</div>
-                <div class="metadata-value">1992</div>
+                <div class="metadata-value" id="meta-epochs">1992</div>
             </div>
         </section>
 
@@ -82,6 +94,50 @@
         <p>Nika - Neural Implicit Video Representations</p>
     </footer>
 
+    <script>
+    const modelData = {
+        "small": {
+            video: "https://nikanet.com/videos/small_ready_comparison.mp4",
+            errorTime: "https://nikanet.com/plots/small_ready_error_over_time.png",
+            spatial: "https://nikanet.com/plots/small_ready_spatial_heatmap.png",
+            psnr: "25.38 dB",
+            config: "small",
+            epochs: "1992"
+        },
+        "tucker-small": {
+            video: "https://nikanet.com/videos/tucker-small-ready-epoch1491-psnr24.15_comparison.mp4",
+            errorTime: "https://nikanet.com/videos/tucker-small-ready-epoch1491-psnr24.15_error_over_time.png",
+            spatial: "https://nikanet.com/videos/tucker-small-ready-epoch1491-psnr24.15_spatial_heatmap.png",
+            psnr: "24.15 dB",
+            config: "tucker-small",
+            epochs: "1491"
+        },
+        "real-small": {
+            video: "https://nikanet.com/videos/real-small-ready-epoch1495-psnr23.37_comparison.mp4",
+            errorTime: "https://nikanet.com/videos/real-small-ready-epoch1495-psnr23.37_error_over_time.png",
+            spatial: "https://nikanet.com/videos/real-small-ready-epoch1495-psnr23.37_spatial_heatmap.png",
+            psnr: "23.37 dB",
+            config: "real-small",
+            epochs: "1495"
+        },
+        "weird-nika": {
+            video: "https://nikanet.com/videos/weird-nika-ready-epoch1490-psnr23.91_comparison.mp4",
+            errorTime: "https://nikanet.com/videos/weird-nika-ready-epoch1490-psnr23.91_error_over_time.png",
+            spatial: "https://nikanet.com/videos/weird-nika-ready-epoch1490-psnr23.91_spatial_heatmap.png",
+            psnr: "23.91 dB",
+            config: "weird-nika",
+            epochs: "1490"
+        },
+        "noconv-nika": {
+            video: "https://nikanet.com/videos/noconv-nika-ready-epoch1491-psnr21.22_comparison.mp4",
+            errorTime: "https://nikanet.com/videos/noconv-nika-ready-epoch1491-psnr21.22_error_over_time.png",
+            spatial: "https://nikanet.com/videos/noconv-nika-ready-epoch1491-psnr21.22_spatial_heatmap.png",
+            psnr: "21.22 dB",
+            config: "noconv-nika",
+            epochs: "1491"
+        }
+    };
+    </script>
     <script src="../js/main.js"></script>
 </body>
 </html>

@@ -21,6 +21,49 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     });
 
+    // Model selector functionality
+    const modelButtons = document.querySelectorAll('.model-button');
+    if (modelButtons.length > 0 && typeof modelData !== 'undefined') {
+        modelButtons.forEach(button => {
+            button.addEventListener('click', function() {
+                const modelId = this.getAttribute('data-model');
+                const data = modelData[modelId];
+                if (!data) return;
+
+                // Update active button
+                modelButtons.forEach(btn => btn.classList.remove('active'));
+                this.classList.add('active');
+
+                // Update video
+                const video = document.getElementById('comparison-video');
+                if (video) {
+                    const source = video.querySelector('source');
+                    if (source) {
+                        source.src = data.video;
+                        video.load();
+                    }
+                }
+
+                // Update plot images
+                const errorTimeImg = document.getElementById('error-time-img');
+                const spatialImg = document.getElementById('spatial-img');
+                if (errorTimeImg) errorTimeImg.src = data.errorTime;
+                if (spatialImg) spatialImg.src = data.spatial;
+
+                // Update metadata
+                const psnrDisplay = document.getElementById('psnr-display');
+                const metaPsnr = document.getElementById('meta-psnr');
+                const metaConfig = document.getElementById('meta-config');
+                const metaEpochs = document.getElementById('meta-epochs');
+
+                if (psnrDisplay) psnrDisplay.textContent = data.psnr;
+                if (metaPsnr) metaPsnr.textContent = data.psnr;
+                if (metaConfig) metaConfig.textContent = data.config;
+                if (metaEpochs) metaEpochs.textContent = data.epochs;
+            });
+        });
+    }
+
     // Lightbox functionality
     const lightbox = document.getElementById('lightbox');
     const lightboxImg = lightbox ? lightbox.querySelector('img') : null;

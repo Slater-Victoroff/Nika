@@ -12,12 +12,22 @@
 
         <div class="detail-header">
             <h1>Yacht</h1>
-            <span class="psnr-badge">PSNR: 28.55 dB</span>
+            <span class="psnr-badge" id="psnr-display">28.55 dB</span>
         </div>
+
+        <section class="model-selector">
+            <div class="model-buttons">
+                <button class="model-button active" data-model="small">small (baseline)</button>
+                <button class="model-button" data-model="tucker-small">tucker-small</button>
+                <button class="model-button" data-model="real-small">real-small</button>
+                <button class="model-button" data-model="weird-nika">weird-nika</button>
+                <button class="model-button" data-model="noconv-nika">noconv-nika</button>
+            </div>
+        </section>
 
         <section class="video-section">
             <div class="video-container">
-                <video controls preload="metadata">
+                <video controls preload="metadata" id="comparison-video">
                     <source src="https://nikanet.com/videos/small_yacht_comparison.mp4" type="video/mp4">
                     Your browser does not support the video tag.
                 </video>
@@ -37,6 +47,7 @@
                 <div class="tab-panel">
                     <img src="https://nikanet.com/plots/small_yacht_error_over_time.png"
                          alt="Yacht error over time"
+                         id="error-time-img"
                          class="lightbox-trigger">
                     <p>PSNR and MSE metrics plotted across all video frames. Higher PSNR indicates better reconstruction quality.</p>
                 </div>
@@ -46,6 +57,7 @@
                 <div class="tab-panel">
                     <img src="https://nikanet.com/plots/small_yacht_spatial_heatmap.png"
                          alt="Yacht spatial heatmap"
+                         id="spatial-img"
                          class="lightbox-trigger">
                     <p>Spatial distribution of reconstruction error. Brighter regions indicate higher error concentrations.</p>
                 </div>
@@ -55,15 +67,15 @@
         <section class="metadata-grid">
             <div class="metadata-item">
                 <div class="metadata-label">PSNR</div>
-                <div class="metadata-value">28.55 dB</div>
+                <div class="metadata-value" id="meta-psnr">28.55 dB</div>
             </div>
             <div class="metadata-item">
                 <div class="metadata-label">Config</div>
-                <div class="metadata-value">small</div>
+                <div class="metadata-value" id="meta-config">small</div>
             </div>
             <div class="metadata-item">
                 <div class="metadata-label">Epochs</div>
-                <div class="metadata-value">1912</div>
+                <div class="metadata-value" id="meta-epochs">1912</div>
             </div>
         </section>
 
@@ -82,6 +94,50 @@
         <p>Nika - Neural Implicit Video Representations</p>
     </footer>
 
+    <script>
+    const modelData = {
+        "small": {
+            video: "https://nikanet.com/videos/small_yacht_comparison.mp4",
+            errorTime: "https://nikanet.com/plots/small_yacht_error_over_time.png",
+            spatial: "https://nikanet.com/plots/small_yacht_spatial_heatmap.png",
+            psnr: "28.55 dB",
+            config: "small",
+            epochs: "1912"
+        },
+        "tucker-small": {
+            video: "https://nikanet.com/videos/tucker-small-yacht-epoch1489-psnr27.82_comparison.mp4",
+            errorTime: "https://nikanet.com/videos/tucker-small-yacht-epoch1489-psnr27.82_error_over_time.png",
+            spatial: "https://nikanet.com/videos/tucker-small-yacht-epoch1489-psnr27.82_spatial_heatmap.png",
+            psnr: "27.82 dB",
+            config: "tucker-small",
+            epochs: "1489"
+        },
+        "real-small": {
+            video: "https://nikanet.com/videos/real-small-yacht-epoch1494-psnr27.11_comparison.mp4",
+            errorTime: "https://nikanet.com/videos/real-small-yacht-epoch1494-psnr27.11_error_over_time.png",
+            spatial: "https://nikanet.com/videos/real-small-yacht-epoch1494-psnr27.11_spatial_heatmap.png",
+            psnr: "27.11 dB",
+            config: "real-small",
+            epochs: "1494"
+        },
+        "weird-nika": {
+            video: "https://nikanet.com/videos/weird-nika-yacht-epoch1488-psnr27.16_comparison.mp4",
+            errorTime: "https://nikanet.com/videos/weird-nika-yacht-epoch1488-psnr27.16_error_over_time.png",
+            spatial: "https://nikanet.com/videos/weird-nika-yacht-epoch1488-psnr27.16_spatial_heatmap.png",
+            psnr: "27.16 dB",
+            config: "weird-nika",
+            epochs: "1488"
+        },
+        "noconv-nika": {
+            video: "https://nikanet.com/videos/noconv-nika-yacht-epoch1490-psnr25.07_comparison.mp4",
+            errorTime: "https://nikanet.com/videos/noconv-nika-yacht-epoch1490-psnr25.07_error_over_time.png",
+            spatial: "https://nikanet.com/videos/noconv-nika-yacht-epoch1490-psnr25.07_spatial_heatmap.png",
+            psnr: "25.07 dB",
+            config: "noconv-nika",
+            epochs: "1490"
+        }
+    };
+    </script>
     <script src="../js/main.js"></script>
 </body>
 </html>
