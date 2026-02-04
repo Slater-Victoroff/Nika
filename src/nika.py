@@ -300,13 +300,13 @@ class ConvOperator(nn.Module):
             nn.GELU(),
             nn.Conv2d(h_dim, h_dim, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(h_dim, h_dim, kernel_size=3, padding=1),
+            nn.Conv2d(h_dim, h_dim, kernel_size=3, padding=1, groups=h_dim),
             nn.GELU(),
             nn.Conv2d(h_dim, out_channels, kernel_size=1),
         ).to(device)
 
-        # zero init last conv layer
         nn.init.zeros_(self.operator[-1].weight)
+        nn.init.zeros_(self.operator[-1].bias)
 
     def forward(self, x):
         if x.all() == 0:
@@ -315,7 +315,8 @@ class ConvOperator(nn.Module):
                 device=self.device,
                 dtype=x.dtype,
             )
-        return self.operator(x)
+        conv_x = self.operator(x)
+        return conv_x
 
 
 class NikaBlock(nn.Module):
@@ -366,7 +367,7 @@ class NikaBlock(nn.Module):
             in_channels=3 * self.C,
             out_channels=out_channels,
             hidden=conv_hidden,
-            k=k,
+            k=k,    
             device=device,
         )
 
@@ -397,8 +398,8 @@ class NikaBlock(nn.Module):
         base_input = torch.cat([grid_out, real_tucker_out, complex_tucker_out], dim=1)
         base_input = self.groupnorm(base_input)
 
-        forward_prediction = torch.zeros_like(base_input)
-        backward_prediction = torch.zeros_like(base_input)
+        prev_frames = torch.zeros_like(base_input)
+        next_frames = torch.zeros_like(base_input)
 
         mask_prev = (t > 0)
         if mask_prev.any():
@@ -408,8 +409,8 @@ class NikaBlock(nn.Module):
             complex_prev = self.complex_tucker(t_prev)
             base_prev = torch.cat([grid_prev, real_prev, complex_prev], dim=1)
             base_prev = self.groupnorm(base_prev)
-            forward_prediction[mask_prev] = base_prev
-        forward_prediction = self.forward_operator(forward_prediction)
+            prev_frames[mask_prev] = base_prev
+        forward_prediction = self.forward_operator(prev_frames)
 
         mask_next = (t < (self.T - 1))
         if mask_next.any():
@@ -419,8 +420,8 @@ class NikaBlock(nn.Module):
             complex_next = self.complex_tucker(t_next)
             base_next = torch.cat([grid_next, real_next, complex_next], dim=1)
             base_next = self.groupnorm(base_next)
-            backward_prediction[mask_next] = base_next
-        backward_prediction = self.backward_operator(backward_prediction)
+            next_frames[mask_next] = base_next
+        backward_prediction = self.backward_operator(next_frames)
 
         aggregated = base_input + forward_prediction + backward_prediction
         refined = self.upres(aggregated)
