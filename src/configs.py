@@ -15,7 +15,7 @@ REFERENCES = {
         "grid_ranks": [3, 40, 50, 70],
         "real_tucker_ranks": [3, 80, 80, 70],
         "complex_tucker_ranks": [3, 60, 60, 50],
-        "conv_hidden": 84,
+        "conv_hidden": 48,
     },
     "tucker-small": {
         "real_tucker_ranks": [3, 80, 80, 80],

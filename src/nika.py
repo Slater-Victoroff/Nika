@@ -250,16 +250,18 @@ class BasicUpres(nn.Module):
         half_k = k // 2
         self.k = k
 
+        base_hdim = hidden
         self.layers = nn.ModuleList([
-            nn.Conv2d(in_channels, hidden, 1),
+            nn.Conv2d(in_channels, base_hdim, 1),
             nn.GELU(),
-            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden),
+            nn.Conv2d(base_hdim, base_hdim, 3, padding=1, groups=base_hdim),
             nn.GELU(),
-            nn.Conv2d(hidden, hidden, 1),
+            nn.Conv2d(base_hdim, base_hdim, 1),
             nn.GELU(),
-            nn.Conv2d(hidden, out_channels * (k ** 2), kernel_size=1),
+            nn.Conv2d(base_hdim, out_channels * (k ** 2), kernel_size=1),
             nn.PixelShuffle(upscale_factor=k),
         ])
+
         self.upres = nn.Sequential(*self.layers).to(device)
 
         #kaiming init
@@ -269,21 +271,9 @@ class BasicUpres(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x, log_times=False):
-        if not log_times:
-            return self.upres(x)
-        times = []
-        inp = x
-        for idx, layer in enumerate(self.layers):
-            torch.cuda.synchronize()
-            start = time.time()
-            inp = layer(inp)
-            torch.cuda.synchronize()
-            elapsed = time.time() - start
-            times.append((type(layer).__name__, elapsed))
-        for i, (name, t) in enumerate(times):
-            print(f"Layer {i}: {name} took {t*1000:.3f} ms")
-        return inp
+    def forward(self, x):
+        base = self.upres(x)
+        return base
 
 
 class ConvOperator(nn.Module):
@@ -349,17 +339,18 @@ class NikaBlock(nn.Module):
         self.groupnorm = nn.GroupNorm(num_groups=3, num_channels=3 * self.C).to(device)
         torch.compile(self.groupnorm)
 
+        op_hdim = 64
         self.forward_operator = ConvOperator(
             in_channels = 3 * self.C,
             out_channels = 3 * self.C,
-            h_dim = 64,
+            h_dim = op_hdim,
             device = device,
         )
 
         self.backward_operator = ConvOperator(
             in_channels = 3 * self.C,
             out_channels = 3 * self.C,
-            h_dim = 64,
+            h_dim = op_hdim,
             device = device,
         )
 
