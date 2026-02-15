@@ -34,7 +34,8 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
         out_channels=3,
         device=device,
     )
-    state_dict = torch.load(all_models[-1], map_location=device)
+    model_path = "models/small-shake-epoch1752-psnr34.99.torch"
+    state_dict = torch.load(model_path, map_location=device)
     model.load_state_dict(state_dict)
     return model
 
@@ -44,6 +45,7 @@ def benchmark_psnr(basedir, vid_name, config, device):
     model = get_best_model("models", vid.shape, vid_name, config, device)
     os.makedirs(f"visuals/{vid_name}/{config}/preds", exist_ok=True)
     os.makedirs(f"visuals/{vid_name}/{config}/residual", exist_ok=True)
+    os.makedirs(f"visuals/{vid_name}/{config}/residual_fft", exist_ok=True)
     model.eval()
     total_psnr = 0.0
     num_frames = vid.shape[0]
@@ -63,11 +65,18 @@ def benchmark_psnr(basedir, vid_name, config, device):
                 save_image(prediction[i], f"visuals/{vid_name}/{config}/preds/pred_frame{min_t + i:03d}.png")
                 # Map residual to [0, 1] by normalizing to its min/max per-frame
                 res = residual[i]
-                if (residual_max - residual_min) > 1e-8:
-                    res_norm = (res - residual_min) / (residual_max - residual_min)
-                else:
-                    res_norm = torch.zeros_like(res)
+                res_norm = torch.abs(res) * 5.0  # scale up for visibility
                 save_image(res_norm, f"visuals/{vid_name}/{config}/residual/residual_frame{min_t + i:03d}.png")
+                # FFT of residual: log-magnitude, centered, normalized per-frame
+                try:
+                    fft_res = torch.fft.fft2(res)
+                    fft_mag = torch.abs(torch.fft.fftshift(fft_res, dim=(-2, -1)))
+                    fft_log = torch.log1p(fft_mag)
+                    fft_norm = fft_log / (fft_log.max() + 1e-8)
+                    save_image(fft_norm, f"visuals/{vid_name}/{config}/residual_fft/residual_fft_frame{min_t + i:03d}.png")
+                except Exception:
+                    # If FFT/save fails, skip silently to avoid breaking benchmark
+                    pass
                 mse = F.mse_loss(prediction[i].clamp(0, 1), batch_gt[i])
                 psnr = 10 * torch.log10(1 / (mse + 1e-8))
                 total_psnr += psnr.item()
@@ -181,12 +190,12 @@ def explain(vid, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:0"
-    name = "bunny"
-    config = "xxs"
+    device = "cuda:1"
+    name = "shake"
+    config = "small"
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    benchmark_psnr("static/benchmarks", name, config, device)
+    benchmark_psnr("static/benchmarks/uvg", name, config, device)
     make_mp4(f"visuals/{name}/{config}/preds", output_path=f"visuals/{name}/{config}/preds/output.mp4", base_name="pred_frame", fps=24)
     make_mp4(f"visuals/{name}/{config}/residual", output_path=f"visuals/{name}/{config}/residual/output.mp4", base_name="residual_frame", fps=24)

@@ -17,6 +17,7 @@ from PIL import Image
 from soap import SOAP
 import random
 from load_data import load_video_frames
+from encoding_utils import FourierEncoding
 from configs import REFERENCES
 
 
@@ -166,6 +167,15 @@ class ComplexTucker(RealTucker):
         return real_tucker.contiguous()
 
 
+def grid_sample_base(H, W, device):
+    y_lin = torch.arange(0, H, device=device)
+    x_lin = torch.arange(0, W, device=device)
+    y_norm = 2.0 * (y_lin / (H - 1)) - 1.0
+    x_norm = 2.0 * (x_lin / (W - 1)) - 1.0
+    y, x = torch.meshgrid(y_norm, x_norm, indexing='ij')  # [H, W]
+    return torch.stack((x, y), dim=-1)  # [H, W, 2]
+
+
 class FeatureGrid(nn.Module):
     def __init__(self, target_shape, grid_res, zero_init=False, device="cuda"):
         super().__init__()
@@ -176,21 +186,17 @@ class FeatureGrid(nn.Module):
         self.grid_t = grid_res[3]
 
         self.grid = nn.Parameter(torch.randn(self.grid_c, self.grid_h, self.grid_w, self.grid_t, device=device) * 1e-2)
-        self.channel_proj = nn.Linear(self.grid_c, self.C, bias=True).to(device)
-        nn.init.normal_(self.channel_proj.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.channel_proj.bias)
-        self.register_buffer("_xy_base", None, persistent=False)
-        self._grid_5d_view = None
-        self._generate_xy_base()
+        if self.grid_c != self.C:
+            self.channel_proj = nn.Linear(self.grid_c, self.C, bias=True).to(device)
+            nn.init.normal_(self.channel_proj.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.channel_proj.bias)
+        self.register_buffer(
+            "_xy_base",
+            grid_sample_base(self.H, self.W, device=device),
+            persistent=False
+        )
 
-    def _generate_xy_base(self):
-        device = self.grid.device
-        y_lin = torch.arange(0, self.H, device=device)
-        x_lin = torch.arange(0, self.W, device=device)
-        y_norm = 2.0 * (y_lin / (self.H - 1)) - 1.0
-        x_norm = 2.0 * (x_lin / (self.W - 1)) - 1.0
-        y, x = torch.meshgrid(y_norm, x_norm, indexing='ij')  # [H, W]
-        self._xy_base = torch.stack((x, y), dim=-1)  # [H, W, 2]
+        self._grid_5d_view = None
     
     def _5d_grid(self):
         return self.grid.permute(0, 3, 1, 2).unsqueeze(0)
@@ -215,9 +221,87 @@ class FeatureGrid(nn.Module):
             padding_mode='border',
         )  # → [B, C, 1, H_out, W_out]
 
-        sampled = sampled.squeeze(2).permute(0, 2, 3, 1)  # [B, H_out, W_out, C]
-        result = self.channel_proj(sampled).permute(0, 3, 1, 2)  # [B, C, H_out, W_out]
+        result = sampled.squeeze(2)
+        if hasattr(self, 'channel_proj'):
+            result = self.channel_proj(result.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         return result.contiguous()
+
+
+class ComplexFeatureGrid(nn.Module):
+    """Feature grid that stores separate real and imaginary parameter grids.
+
+    Sampling is performed independently on the real and imaginary grids via
+    `F.grid_sample`, then combined into a complex frequency tensor. We enforce
+    Hermitian symmetry (so the inverse FFT yields real values) using
+    `hermitian_project_shifted`, then return the real part of the inverse FFT.
+    """
+    def __init__(self, target_shape, grid_res, zero_init=False, device="cuda"):
+        super().__init__()
+        self.C, self.H, self.W, self.T = target_shape
+        self.grid_c = grid_res[0]
+        self.grid_h = grid_res[1]
+        self.grid_w = grid_res[2]
+        self.grid_t = grid_res[3]
+
+        # separate real and imaginary parameter grids
+        self.grid_real = nn.Parameter(torch.randn(self.grid_c, self.grid_h, self.grid_w, self.grid_t, device=device) * 1e-2)
+        self.grid_imag = nn.Parameter(torch.randn(self.grid_c, self.grid_h, self.grid_w, self.grid_t, device=device) * 1e-2)
+        if self.grid_c != self.C:
+            self.channel_proj = nn.Linear(self.grid_c, self.C, bias=True).to(device)
+            nn.init.normal_(self.channel_proj.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.channel_proj.bias)
+        self.register_buffer(
+            "_xy_base",
+            grid_sample_base(self.H, self.W, device=device),
+            persistent=False
+        )
+
+    def _5d_grid_real(self):
+        return self.grid_real.permute(0, 3, 1, 2).unsqueeze(0)
+
+    def _5d_grid_imag(self):
+        return self.grid_imag.permute(0, 3, 1, 2).unsqueeze(0)
+
+    def forward(self, t):
+        device = self.grid_real.device
+        B = t.shape[0]
+
+        sample_grid3 = torch.empty((B, self.H, self.W, 3), device=device, dtype=self._xy_base.dtype)
+        sample_grid3[..., :2] = self._xy_base
+        sample_grid3[..., 2] = (2.0 * t - 1.0).view(B, 1, 1)
+        sample_grid3 = sample_grid3.unsqueeze(1)  # [B,1,H,W,3]
+
+        # expand parameter grids to batch and sample real/imag separately
+        grid5_real = self._5d_grid_real().expand(B, -1, -1, -1, -1)
+        grid5_imag = self._5d_grid_imag().expand(B, -1, -1, -1, -1)
+
+        sampled_real = F.grid_sample(
+            grid5_real,
+            sample_grid3,
+            mode='bilinear',
+            align_corners=True,
+            padding_mode='border',
+        ).squeeze(2)  # [B, Cg, H, W]
+
+        sampled_imag = F.grid_sample(
+            grid5_imag,
+            sample_grid3,
+            mode='bilinear',
+            align_corners=True,
+            padding_mode='border',
+        ).squeeze(2)
+
+        # project channels if necessary (per-pixel linear)
+        if hasattr(self, 'channel_proj'):
+            sampled_real = self.channel_proj(sampled_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            sampled_imag = self.channel_proj(sampled_imag.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+        # combine into complex frequency tensor and enforce Hermitian symmetry
+        freq = torch.complex(sampled_real, sampled_imag)
+        # hermitian_project_shifted expects shape (B, C, H, W) where B is treated like batch/temporal
+        base = hermitian_project_shifted(freq)
+        real_out = torch.fft.ifft2(base, norm='ortho').real
+        return real_out.contiguous()
 
 
 def tucker_construct(UT, UC, UH, UW, G):
@@ -242,6 +326,94 @@ def tucker_construct(UT, UC, UH, UW, G):
 
     X = torch.einsum('ijkl,ti,cj,hk,wl->tchw', G, UT, UC, UH, UW)
     return X
+
+
+class TimeModulatedSampler(nn.Module):
+    def __init__(self, target_res, input_channels, encoding_len, max_mag=0.1, channelwise:bool=False, device='cuda'):
+        super().__init__()
+        self.H, self.W = target_res
+        self.C = input_channels   
+        self.channelwise = channelwise
+        self.max_mag = max_mag
+
+        out_dim = 4 * self.C if self.channelwise else 4
+        self.affine_net = nn.Sequential(
+            nn.Linear(encoding_len, 64),
+            nn.GELU(),
+            nn.Linear(64, 64),
+            nn.GELU(),
+            nn.Linear(64, out_dim),
+            nn.Tanh(),
+        ).to(device)
+        nn.init.zeros_(self.affine_net[-2].weight)
+        nn.init.zeros_(self.affine_net[-2].bias)
+
+        self.time_encoding = FourierEncoding(
+            target_dim=encoding_len,
+            max_freq=max(self.H, self.W) // 2,
+            device=device
+        )
+
+        # self.register_buffer("_xy_base", grid_sample_base(self.H, self.W, device=device), persistent=False)
+    
+    @staticmethod
+    def _theta_from_params(tx, ty, rot, log_s):
+        s = torch.exp(log_s).squeeze(-1)
+        c = torch.cos(rot).squeeze(-1)
+        si = torch.sin(rot).squeeze(-1)
+
+        theta = torch.zeros((tx.shape[0], 2, 3), device=tx.device, dtype=tx.dtype)
+        theta[:, 0, 0] = s * c
+        theta[:, 0, 1] = -s * si
+        theta[:, 1, 0] = s * si
+        theta[:, 1, 1] = s * c
+        theta[:, 0, 2] = tx.squeeze(-1)
+        theta[:, 1, 2] = ty.squeeze(-1)
+        return theta
+        
+    def forward(self, X, t):
+        # device = self._xy_base.device
+        B = t.shape[0]
+
+        time_emb = self.time_encoding(t)
+        warp = self.affine_net(time_emb)
+
+        if self.channelwise:
+            # (B, C, 4) -> (B*C, 4)
+            warp = warp.view(B, self.C, 4).reshape(B * self.C, 4)
+
+            tx, ty, rot, log_s = warp.chunk(4, dim=-1)           # each (B*C, 1)
+            theta = self._theta_from_params(tx, ty, rot, log_s)  # (B*C, 2, 3)
+
+            grid = F.affine_grid(theta, size=(B * self.C, 1, self.H, self.W), align_corners=True)
+
+            # Fold channels into batch so one grid_sample does everything
+            X_bc = X.reshape(B * self.C, 1, self.H, self.W)
+            Y_bc = F.grid_sample(X_bc, grid, mode='bilinear', align_corners=True, padding_mode='border')
+            Y = Y_bc.view(B, self.C, self.H, self.W)
+        else:
+            tx, ty, rot, log_s = warp.chunk(4, dim=-1)           # each (B, 1)
+            theta = self._theta_from_params(tx, ty, rot, log_s)  # (B, 2, 3)
+            grid = F.affine_grid(theta, size=(B, self.C, self.H, self.W), align_corners=False)
+            Y = F.grid_sample(X, grid, mode='bilinear', align_corners=False, padding_mode='border')
+
+        return Y.contiguous()
+
+
+class TextureAtlas(nn.Module):
+    def __init__(self, atlas_res, target_res, device='cuda'):
+        super().__init__()
+        self.C, self.H, self.W, self.T = atlas_res
+        self.atlas = nn.Parameter(torch.randn(self.C, self.H, self.W, self.T, device=device) * 1e-2)
+        self.target_res = target_res
+        self.target_
+
+    def forward(self, t):
+        device = self.atlas.device
+        B = t.shape[0]
+        X = self.atlas.unsqueeze(0).expand(B, -1, -1, -1)
+        return X.contiguous()
+        # return self.warper(X, t)
 
 
 class BasicUpres(nn.Module):
@@ -336,6 +508,11 @@ class NikaBlock(nn.Module):
         )
         torch.compile(self.grid_features)
 
+        # self.texture_atlas = TextureAtlas(
+        #     atlas_res=(self.C, self.H, self.W),
+        #     device=device,
+        # )
+
         self.groupnorm = nn.GroupNorm(num_groups=3, num_channels=3 * self.C).to(device)
         torch.compile(self.groupnorm)
 
@@ -354,6 +531,13 @@ class NikaBlock(nn.Module):
             device = device,
         )
 
+        # self.warp = TimeModulatedSampler(
+        #     target_res=self.internal_shape[1:-1],  # cut off channels and time
+        #     input_channels=2 * self.C,
+        #     encoding_len=64,
+        #     device=device,
+        # )
+
         self.upres = BasicUpres(
             in_channels=3 * self.C,
             out_channels=out_channels,
@@ -368,25 +552,31 @@ class NikaBlock(nn.Module):
         real_tucker_params = sum(p.numel() for p in self.real_tucker.parameters())
         complex_tucker_params = sum(p.numel() for p in self.complex_tucker.parameters())
         grid_params = sum(p.numel() for p in self.grid_features.parameters())
+        # texture_atlas_params = sum(p.numel() for p in self.texture_atlas.parameters())
         upres_params = sum(p.numel() for p in self.upres.parameters())
         operator_params = sum(p.numel() for p in self.forward_operator.parameters()) + sum(p.numel() for p in self.backward_operator.parameters())
-        total_params = real_tucker_params + complex_tucker_params + grid_params + upres_params + operator_params
+        # warp_params = sum(p.numel() for p in self.warp.parameters())
+        total_params = real_tucker_params + complex_tucker_params + grid_params + upres_params + operator_params #+ warp_params
         print(f"NikaBlock parameters:")
         print(f"  Real Tucker:     {real_tucker_params / 1e6:.3f}M")
         print(f"  Complex Tucker:  {complex_tucker_params / 1e6:.3f}M")
         print(f"  Feature Grid:    {grid_params / 1e6:.3f}M")
+        # print(f"  Texture Atlas:   {texture_atlas_params / 1e6:.3f}M")
         print(f"  Forward Operator:{sum(p.numel() for p in self.forward_operator.parameters()) / 1e6:.3f}M")
         print(f"  Backward Operator:{sum(p.numel() for p in self.backward_operator.parameters()) / 1e6:.3f}M")
         print(f"  Upsampling CNN:  {upres_params / 1e6:.3f}M")
+        # print(f"  Warp:            {warp_params / 1e6:.3f}M")
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
     def forward(self, t):
         if type(t) is not torch.Tensor:
             t = torch.tensor([t], device=self.grid_features.grid.device, dtype=torch.int64)
         grid_out = self.grid_features(t / (self.T - 1))
+        # texture_out = self.texture_atlas(t / (self.T - 1))
         real_tucker_out = self.real_tucker(t)
         complex_tucker_out = self.complex_tucker(t)
         base_input = torch.cat([grid_out, real_tucker_out, complex_tucker_out], dim=1)
+        # base_input = self.warp(base_input, t)
         base_input = self.groupnorm(base_input)
 
         prev_frames = torch.zeros_like(base_input)
@@ -396,9 +586,11 @@ class NikaBlock(nn.Module):
         if mask_prev.any():
             t_prev = (t[mask_prev] - 1)
             grid_prev = self.grid_features(t_prev / (self.T - 1))
+            # texture_prev = self.texture_atlas(t_prev / (self.T - 1))
             real_prev = self.real_tucker(t_prev)
             complex_prev = self.complex_tucker(t_prev)
             base_prev = torch.cat([grid_prev, real_prev, complex_prev], dim=1)
+            # base_prev = self.warp(base_prev, t_prev)
             base_prev = self.groupnorm(base_prev)
             prev_frames[mask_prev] = base_prev
         forward_prediction = self.forward_operator(prev_frames)
@@ -407,14 +599,17 @@ class NikaBlock(nn.Module):
         if mask_next.any():
             t_next = (t[mask_next] + 1)
             grid_next = self.grid_features(t_next / (self.T - 1))
+            # texture_next = self.texture_atlas(t_next / (self.T - 1))
             real_next = self.real_tucker(t_next)
             complex_next = self.complex_tucker(t_next)
             base_next = torch.cat([grid_next, real_next, complex_next], dim=1)
+            # base_next = self.warp(base_next, t_next)
             base_next = self.groupnorm(base_next)
             next_frames[mask_next] = base_next
         backward_prediction = self.backward_operator(next_frames)
 
         aggregated = base_input + forward_prediction + backward_prediction
+        # warped_agg = self.warp(aggregated, t)
         refined = self.upres(aggregated)
         return refined
 
@@ -491,10 +686,10 @@ def feature_test(vid, name, config, device):
 
 if __name__ == "__main__":
     device = "cuda:1"
-    name = "beauty"
+    name = "ready"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    feature_test(vid, name, "small", device=device)
+    feature_test(vid, name, f"small", device=device)
