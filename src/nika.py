@@ -508,11 +508,6 @@ class NikaBlock(nn.Module):
         )
         torch.compile(self.grid_features)
 
-        # self.texture_atlas = TextureAtlas(
-        #     atlas_res=(self.C, self.H, self.W),
-        #     device=device,
-        # )
-
         self.groupnorm = nn.GroupNorm(num_groups=3, num_channels=3 * self.C).to(device)
         torch.compile(self.groupnorm)
 
@@ -531,13 +526,6 @@ class NikaBlock(nn.Module):
             device = device,
         )
 
-        # self.warp = TimeModulatedSampler(
-        #     target_res=self.internal_shape[1:-1],  # cut off channels and time
-        #     input_channels=2 * self.C,
-        #     encoding_len=64,
-        #     device=device,
-        # )
-
         self.upres = BasicUpres(
             in_channels=3 * self.C,
             out_channels=out_channels,
@@ -552,31 +540,31 @@ class NikaBlock(nn.Module):
         real_tucker_params = sum(p.numel() for p in self.real_tucker.parameters())
         complex_tucker_params = sum(p.numel() for p in self.complex_tucker.parameters())
         grid_params = sum(p.numel() for p in self.grid_features.parameters())
-        # texture_atlas_params = sum(p.numel() for p in self.texture_atlas.parameters())
         upres_params = sum(p.numel() for p in self.upres.parameters())
         operator_params = sum(p.numel() for p in self.forward_operator.parameters()) + sum(p.numel() for p in self.backward_operator.parameters())
-        # warp_params = sum(p.numel() for p in self.warp.parameters())
-        total_params = real_tucker_params + complex_tucker_params + grid_params + upres_params + operator_params #+ warp_params
+        total_params = real_tucker_params + complex_tucker_params + grid_params + upres_params + operator_params
         print(f"NikaBlock parameters:")
         print(f"  Real Tucker:     {real_tucker_params / 1e6:.3f}M")
         print(f"  Complex Tucker:  {complex_tucker_params / 1e6:.3f}M")
         print(f"  Feature Grid:    {grid_params / 1e6:.3f}M")
-        # print(f"  Texture Atlas:   {texture_atlas_params / 1e6:.3f}M")
         print(f"  Forward Operator:{sum(p.numel() for p in self.forward_operator.parameters()) / 1e6:.3f}M")
         print(f"  Backward Operator:{sum(p.numel() for p in self.backward_operator.parameters()) / 1e6:.3f}M")
         print(f"  Upsampling CNN:  {upres_params / 1e6:.3f}M")
-        # print(f"  Warp:            {warp_params / 1e6:.3f}M")
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
-    def forward(self, t):
+    def forward(self, t, zero_real_tucker=False, zero_complex_tucker=False, zero_feature_grid=False, return_operators=False):
         if type(t) is not torch.Tensor:
             t = torch.tensor([t], device=self.grid_features.grid.device, dtype=torch.int64)
         grid_out = self.grid_features(t / (self.T - 1))
-        # texture_out = self.texture_atlas(t / (self.T - 1))
         real_tucker_out = self.real_tucker(t)
         complex_tucker_out = self.complex_tucker(t)
+        if zero_real_tucker:
+            real_tucker_out = torch.zeros_like(real_tucker_out)
+        if zero_complex_tucker:
+            complex_tucker_out = torch.zeros_like(complex_tucker_out)
+        if zero_feature_grid:
+            grid_out = torch.zeros_like(grid_out)
         base_input = torch.cat([grid_out, real_tucker_out, complex_tucker_out], dim=1)
-        # base_input = self.warp(base_input, t)
         base_input = self.groupnorm(base_input)
 
         prev_frames = torch.zeros_like(base_input)
@@ -586,11 +574,15 @@ class NikaBlock(nn.Module):
         if mask_prev.any():
             t_prev = (t[mask_prev] - 1)
             grid_prev = self.grid_features(t_prev / (self.T - 1))
-            # texture_prev = self.texture_atlas(t_prev / (self.T - 1))
             real_prev = self.real_tucker(t_prev)
             complex_prev = self.complex_tucker(t_prev)
+            if zero_real_tucker:
+                real_prev = torch.zeros_like(real_prev)
+            if zero_complex_tucker:
+                complex_prev = torch.zeros_like(complex_prev)
+            if zero_feature_grid:
+                grid_prev = torch.zeros_like(grid_prev)
             base_prev = torch.cat([grid_prev, real_prev, complex_prev], dim=1)
-            # base_prev = self.warp(base_prev, t_prev)
             base_prev = self.groupnorm(base_prev)
             prev_frames[mask_prev] = base_prev
         forward_prediction = self.forward_operator(prev_frames)
@@ -599,18 +591,25 @@ class NikaBlock(nn.Module):
         if mask_next.any():
             t_next = (t[mask_next] + 1)
             grid_next = self.grid_features(t_next / (self.T - 1))
-            # texture_next = self.texture_atlas(t_next / (self.T - 1))
             real_next = self.real_tucker(t_next)
             complex_next = self.complex_tucker(t_next)
+            if zero_real_tucker:
+                real_next = torch.zeros_like(real_next)
+            if zero_complex_tucker:
+                complex_next = torch.zeros_like(complex_next)
+            if zero_feature_grid:
+                grid_next = torch.zeros_like(grid_next)
             base_next = torch.cat([grid_next, real_next, complex_next], dim=1)
-            # base_next = self.warp(base_next, t_next)
             base_next = self.groupnorm(base_next)
             next_frames[mask_next] = base_next
         backward_prediction = self.backward_operator(next_frames)
 
         aggregated = base_input + forward_prediction + backward_prediction
-        # warped_agg = self.warp(aggregated, t)
         refined = self.upres(aggregated)
+        if return_operators:
+            refined_forward = self.upres(forward_prediction)
+            refined_backward = self.upres(backward_prediction)
+            return refined, refined_forward, refined_backward
         return refined
 
     def test_images(self, output_dir):
@@ -685,8 +684,8 @@ def feature_test(vid, name, config, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:1"
-    name = "ready"
+    device = "cuda:0"
+    name = "honey"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")

@@ -34,7 +34,8 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
         out_channels=3,
         device=device,
     )
-    model_path = "models/small-shake-epoch1752-psnr34.99.torch"
+    model_path = all_models[-1]
+    # model_path = "models/ref_models/small-beauty-epoch1999-psnr33.36.torch"
     state_dict = torch.load(model_path, map_location=device)
     model.load_state_dict(state_dict)
     return model
@@ -42,10 +43,23 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
 
 def benchmark_psnr(basedir, vid_name, config, device):
     vid = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
-    model = get_best_model("models", vid.shape, vid_name, config, device)
+    model = get_best_model("models/ref_models", vid.shape, vid_name, config, device)
+
+    core_image = model.grid_features.grid.data.cpu().numpy().copy()
+    print(f"Core image shape: {core_image.shape}, value range: [{core_image.min()}, {core_image.max()}]")
+
+    # Convert to tensor and make it a valid image: [C, H, W], normalized to [0, 1]
+    core_t = torch.from_numpy(core_image).squeeze(-1).to(torch.float32)
+    # Use first 3 channels for RGB visualization
+    core_t = core_t[:3, ...]
+    # Percentile-based normalization to avoid gray-looking images
+    q_low = torch.quantile(core_t, 0.01)
+    q_high = torch.quantile(core_t, 0.99)
+    core_t = (core_t - q_low) / (q_high - q_low + 1e-8)
+    core_t = core_t.clamp(0.0, 1.0)
+    save_image(core_t, f"visuals/{vid_name}/{config}/core_image.png")
     os.makedirs(f"visuals/{vid_name}/{config}/preds", exist_ok=True)
     os.makedirs(f"visuals/{vid_name}/{config}/residual", exist_ok=True)
-    os.makedirs(f"visuals/{vid_name}/{config}/residual_fft", exist_ok=True)
     model.eval()
     total_psnr = 0.0
     num_frames = vid.shape[0]
@@ -115,6 +129,100 @@ def make_mp4(png_frame_dir, output_path="output.mp4", base_name="pred_frame", fp
         output_path
     ]
     subprocess.run(cmd, check=True)
+
+
+def ablation_harness(basedir, vid_name, n_frames, config, device, variants=None, batch_size=10):
+    """Run several ablation variants using `NikaBlock.forward` flags and save frames.
+
+    Variants (default):
+      - 'baseline'
+      - 'no_tucker' (zero both real and complex tucker heads)
+      - 'zero_real'
+      - 'zero_complex'
+      - 'forward_backward_upres' (use the forward/back outputs passed through `upres`)
+    """
+    if variants is None:
+        variants = ['baseline', 'only_grid', 'only_realt', 'only_complext', 'gridless', 'forward_backward_upres']
+
+    # Determine model input shape using a single-frame probe (avoids loading full video)
+    probe = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=1, dtype=torch.uint8, normalize=False)
+    probe_shape = probe.shape  # (T_probe, C, H, W)
+    # Use the provided `n_frames` for temporal length, but match spatial/channel dims from probe
+    vid_shape = [n_frames, probe_shape[1], probe_shape[2], probe_shape[3]]
+    model = get_best_model("models/ref_models", vid_shape, vid_name, config, device)
+    model.eval()
+
+    num_frames = int(n_frames)
+    num_batches = (num_frames + batch_size - 1) // batch_size
+
+    for v in variants:
+        # create main preds dir for variant
+        os.makedirs(f"visuals/{vid_name}/{config}/{v}/preds", exist_ok=True)
+        # if storing forward/back separately, create subfolders
+        if v == 'forward_backward_upres':
+            os.makedirs(f"visuals/{vid_name}/{config}/{v}/forward/preds", exist_ok=True)
+            os.makedirs(f"visuals/{vid_name}/{config}/{v}/backward/preds", exist_ok=True)
+
+    with torch.no_grad():
+        for batch_idx in range(num_batches):
+            min_t = batch_idx * batch_size
+            max_t = min((batch_idx + 1) * batch_size, num_frames)
+            t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
+
+            # baseline call
+            if 'baseline' in variants:
+                out_base = model(t_batch)
+
+            # zeroed variants use forward flags
+            if 'no_tucker' in variants:
+                out_no_tucker = model(t_batch, zero_real_tucker=True, zero_complex_tucker=True)
+            if 'only_realt' in variants:
+                out_zero_real = model(t_batch, zero_complex_tucker=True, zero_feature_grid=True)
+            if 'only_complext' in variants:
+                out_zero_complex = model(t_batch, zero_real_tucker=True, zero_feature_grid=True)
+            if 'gridless' in variants:
+                out_backless = model(t_batch, zero_feature_grid=True)
+
+            # forward/backward operators passed through upres
+            if 'forward_backward_upres' in variants:
+                # model.forward(..., return_operators=True) -> (refined, refined_forward, refined_backward)
+                _, refined_forward, refined_backward = model(t_batch, return_operators=True)
+                out_forward = refined_forward
+                out_backward = refined_backward
+
+            # save per-variant frames
+            for i in range(t_batch.shape[0]):
+                idx = min_t + i
+                if 'baseline' in variants:
+                    save_image(out_base[i], f"visuals/{vid_name}/{config}/baseline/preds/pred_frame{idx:03d}.png")
+                if 'no_tucker' in variants:
+                    save_image(out_no_tucker[i], f"visuals/{vid_name}/{config}/no_tucker/preds/pred_frame{idx:03d}.png")
+                if 'only_realt' in variants:
+                    save_image(out_zero_real[i], f"visuals/{vid_name}/{config}/only_realt/preds/pred_frame{idx:03d}.png")
+                if 'only_complext' in variants:
+                    save_image(out_zero_complex[i], f"visuals/{vid_name}/{config}/only_complext/preds/pred_frame{idx:03d}.png")
+                if 'gridless' in variants:
+                    save_image(out_backless[i], f"visuals/{vid_name}/{config}/gridless/preds/pred_frame{idx:03d}.png")
+                if 'forward_backward_upres' in variants:
+                    save_image(out_forward[i], f"visuals/{vid_name}/{config}/forward_backward_upres/forward/preds/pred_frame{idx:03d}.png")
+                    save_image(out_backward[i], f"visuals/{vid_name}/{config}/forward_backward_upres/backward/preds/pred_frame{idx:03d}.png")
+
+    # make mp4s
+    # make mp4s
+    for v in variants:
+        try:
+            if v == 'forward_backward_upres':
+                fwd_src = f"visuals/{vid_name}/{config}/{v}/forward/preds"
+                bwd_src = f"visuals/{vid_name}/{config}/{v}/backward/preds"
+                make_mp4(fwd_src, output_path=f"visuals/{vid_name}/{config}/{v}/forward.mp4", base_name="pred_frame", fps=24)
+                make_mp4(bwd_src, output_path=f"visuals/{vid_name}/{config}/{v}/backward.mp4", base_name="pred_frame", fps=24)
+            else:
+                src_dir = f"visuals/{vid_name}/{config}/{v}/preds"
+                out_path = f"visuals/{vid_name}/{config}/{v}/preds.mp4"
+                make_mp4(src_dir, output_path=out_path, base_name="pred_frame", fps=24)
+        except Exception as e:
+            print(f"Failed to create mp4 for {v}: {e}")
+
 
 def explain(vid, device):
     batch_size = 50
@@ -191,11 +299,12 @@ def explain(vid, device):
 
 if __name__ == "__main__":
     device = "cuda:1"
-    name = "shake"
+    name = "beauty"
     config = "small"
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    benchmark_psnr("static/benchmarks/uvg", name, config, device)
-    make_mp4(f"visuals/{name}/{config}/preds", output_path=f"visuals/{name}/{config}/preds/output.mp4", base_name="pred_frame", fps=24)
-    make_mp4(f"visuals/{name}/{config}/residual", output_path=f"visuals/{name}/{config}/residual/output.mp4", base_name="residual_frame", fps=24)
+    ablation_harness("static/benchmarks/uvg", name, n_frames=600, config=config, device=device)
+    # benchmark_psnr("static/benchmarks/uvg", name, config, device)
+    # make_mp4(f"visuals/{name}/{config}/preds", output_path=f"visuals/{name}/{config}/preds/output.mp4", base_name="pred_frame", fps=24)
+    # make_mp4(f"visuals/{name}/{config}/residual", output_path=f"visuals/{name}/{config}/residual/output.mp4", base_name="residual_frame", fps=24)
