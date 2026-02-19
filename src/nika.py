@@ -217,7 +217,7 @@ class FeatureGrid(nn.Module):
             grid_5d,               # [B, C, T_g, H_g, W_g]
             sample_grid3,           # [B, 1, H_out, W_out, 3]
             mode='bilinear',
-            align_corners=True,
+            align_corners=False,
             padding_mode='border',
         )  # → [B, C, 1, H_out, W_out]
 
@@ -416,6 +416,27 @@ class TextureAtlas(nn.Module):
         # return self.warper(X, t)
 
 
+class NikaNoise(nn.Module):
+    def __init__(self, max_mag, max_epochs, schedule="logarithmic", device='cuda'):
+        super().__init__()
+        self.max_mag = max_mag
+        self.max_epochs = max_epochs
+        self.schedule = schedule
+        self.device = device
+
+    def forward(self, X, epoch):
+        x_span = X.max() - X.min()
+        scaled_max_mag = self.max_mag * x_span
+        if self.schedule == "logarithmic":
+            mag = scaled_max_mag * (1 - math.log(epoch + 1) / math.log(self.max_epochs))
+        elif self.schedule == "linear":
+            mag = scaled_max_mag * (1 - epoch / self.max_epochs)
+        else:
+            raise ValueError(f"Unsupported schedule: {self.schedule}")
+        noise = torch.randn_like(X) * mag
+        return X + noise
+
+
 class BasicUpres(nn.Module):
     def __init__(self, in_channels, out_channels, hidden, k, device='cuda'):
         super().__init__()
@@ -518,6 +539,7 @@ class NikaBlock(nn.Module):
             h_dim = op_hdim,
             device = device,
         )
+        self.forward_operator = torch.compile(self.forward_operator)
 
         self.backward_operator = ConvOperator(
             in_channels = 3 * self.C,
@@ -525,6 +547,7 @@ class NikaBlock(nn.Module):
             h_dim = op_hdim,
             device = device,
         )
+        self.backward_operator = torch.compile(self.backward_operator)
 
         self.upres = BasicUpres(
             in_channels=3 * self.C,
@@ -533,6 +556,7 @@ class NikaBlock(nn.Module):
             k=k,    
             device=device,
         )
+        self.upres = torch.compile(self.upres)
 
         self.log_stats()
 
@@ -552,7 +576,7 @@ class NikaBlock(nn.Module):
         print(f"  Upsampling CNN:  {upres_params / 1e6:.3f}M")
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
-    def forward(self, t, zero_real_tucker=False, zero_complex_tucker=False, zero_feature_grid=False, return_operators=False):
+    def forward(self, t, noise_op=None, zero_real_tucker=False, zero_complex_tucker=False, zero_feature_grid=False, return_operators=False):
         if type(t) is not torch.Tensor:
             t = torch.tensor([t], device=self.grid_features.grid.device, dtype=torch.int64)
         grid_out = self.grid_features(t / (self.T - 1))
@@ -605,6 +629,9 @@ class NikaBlock(nn.Module):
         backward_prediction = self.backward_operator(next_frames)
 
         aggregated = base_input + forward_prediction + backward_prediction
+
+        if noise_op is not None:
+            aggregated = noise_op(aggregated)
         refined = self.upres(aggregated)
         if return_operators:
             refined_forward = self.upres(forward_prediction)
@@ -640,6 +667,7 @@ def feature_test(vid, name, config, device):
         out_channels=3,
         device=device,
     )
+    noise = NikaNoise(max_mag=0.1, max_epochs=2000, schedule="logarithmic", device=device)
 
     opt = SOAP(list(model.parameters()), lr=1e-2)
 
@@ -650,13 +678,14 @@ def feature_test(vid, name, config, device):
         opt.zero_grad(set_to_none=True)
         loss = 0.0
         start_time = time.time()
+        noise_op = partial(noise, epoch=epoch)
         num_batches = (vid.shape[0] + batch_size - 1) // batch_size
         for t in range(num_batches):
             min_t = t * batch_size
             max_t = min((t + 1) * batch_size, vid.shape[0])
             batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
             t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
-            prediction = model(t_batch)
+            prediction = model(t_batch, noise_op=noise_op)
             mse = F.mse_loss(prediction, batch_gt)
             psnr = -10.0 * torch.log10(mse + 1e-8)
             frame_loss = (-psnr).mean() / num_batches
@@ -684,8 +713,8 @@ def feature_test(vid, name, config, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:0"
-    name = "honey"
+    device = "cuda:1"
+    name = "beauty"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
