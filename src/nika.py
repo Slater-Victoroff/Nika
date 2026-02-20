@@ -369,24 +369,24 @@ class NikaBlock(nn.Module):
             ranks=real_tucker_ranks,
             device=device,
         )
-        torch.compile(self.real_tucker)
+        self.real_tucker = torch.compile(self.real_tucker)
 
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
             ranks=complex_tucker_ranks,
             device=device,
         )
-        torch.compile(self.complex_tucker)
+        # Can't compile complex stuff
 
         self.grid_features = FeatureGrid(
             target_shape=self.internal_shape,
             grid_res=grid_ranks,
             device=device,
         )
-        torch.compile(self.grid_features)
+        self.grid_features = torch.compile(self.grid_features)
 
         self.groupnorm = nn.GroupNorm(num_groups=3, num_channels=3 * self.C).to(device)
-        torch.compile(self.groupnorm)
+        self.groupnorm = torch.compile(self.groupnorm)
 
         op_hdim = 64
         self.forward_operator = ConvOperator(
@@ -469,7 +469,6 @@ class NikaBlock(nn.Module):
             base_prev = self.groupnorm(base_prev)
             prev_frames[mask_prev] = base_prev
         forward_prediction = self.forward_operator(prev_frames, norm_t_prev)
-        # forward_prediction = self.rk4_forward(prev_frames, t[mask_prev])
 
         mask_next = (t < (self.T - 1))
         if mask_next.any():
@@ -488,7 +487,6 @@ class NikaBlock(nn.Module):
             base_next = self.groupnorm(base_next)
             next_frames[mask_next] = base_next
         backward_prediction = self.backward_operator(next_frames, norm_t_next)
-        # backward_prediction = self.rk4_backward(next_frames, t[mask_next])
 
         aggregated = base_input + forward_prediction + backward_prediction
 
@@ -529,7 +527,6 @@ def feature_test(vid, name, config, device):
         out_channels=3,
         device=device,
     )
-    noise = NikaNoise(max_mag=0.1, max_epochs=2000, schedule="logarithmic", device=device)
 
     opt = SOAP(list(model.parameters()), lr=1e-2)
 
@@ -540,14 +537,12 @@ def feature_test(vid, name, config, device):
         opt.zero_grad(set_to_none=True)
         loss = 0.0
         start_time = time.time()
-        noise_op = partial(noise, epoch=epoch)
         num_batches = (vid.shape[0] + batch_size - 1) // batch_size
         for t in range(num_batches):
             min_t = t * batch_size
             max_t = min((t + 1) * batch_size, vid.shape[0])
             batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
             t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
-            # prediction = model(t_batch, noise_op=noise_op)
             prediction = model(t_batch)
             mse = F.mse_loss(prediction, batch_gt)
             psnr = -10.0 * torch.log10(mse + 1e-8)
@@ -576,8 +571,8 @@ def feature_test(vid, name, config, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:0"
-    name = "honey"
+    device = "cuda:1"
+    name = "shake"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
