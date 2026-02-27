@@ -119,11 +119,8 @@ class TuckerFactor(nn.Module):
     def get(self, target):
         U = self.forward()
         target = torch.as_tensor(target, device=U.device, dtype=torch.float32)
-        if target.dim() == 0:
-            target = target[None]
 
-        denom = max(self.target_dim - 1, 1)
-        t_norm = 2.0 * (target / denom) - 1.0  # [-1, 1]
+        t_norm = 2.0 * target - 1.0  # [-1, 1]
         t_norm = t_norm.view(1, -1, 1, 1)
 
         grid = torch.zeros((1, t_norm.shape[1], 1, 2), device=U.device, dtype=t_norm.dtype)
@@ -294,7 +291,7 @@ class BasicUpres(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x, t):
+    def forward(self, x):
         base = self.upres(x)
         return base
 
@@ -362,6 +359,7 @@ class NikaBlock(nn.Module):
         self.C, self.H, self.W, self.T = target_shape
         self.H = int(self.H // k); self.W = int(self.W // k)
         self.internal_shape = [self.C, self.H, self.W, self.T]
+        self.dT = 1.0 / (self.T - 1)
         self.real_tucker = RealTucker(
             target_shape=self.internal_shape,
             ranks=real_tucker_ranks,
@@ -388,7 +386,7 @@ class NikaBlock(nn.Module):
 
         op_hdim = 64
         self.forward_operator = ConvOperator(
-            in_channels = 3 * self.C,
+            in_channels = 6 * self.C,
             out_channels = 3 * self.C,
             h_dim = op_hdim,
             device = device,
@@ -396,7 +394,7 @@ class NikaBlock(nn.Module):
         self.forward_operator = torch.compile(self.forward_operator)
 
         self.backward_operator = ConvOperator(
-            in_channels = 3 * self.C,
+            in_channels = 6 * self.C,
             out_channels = 3 * self.C,
             h_dim = op_hdim,
             device = device,
@@ -430,68 +428,63 @@ class NikaBlock(nn.Module):
         print(f"  Upsampling CNN:  {upres_params / 1e6:.3f}M")
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
-    def forward(self, t, noise_op=None, zero_real_tucker=False, zero_complex_tucker=False, zero_feature_grid=False, return_operators=False):
-        if type(t) is not torch.Tensor:
-            t = torch.tensor([t], device=self.grid_features.grid.device, dtype=torch.int64)
-        norm_t = t / (self.T - 1)
-        grid_out = self.grid_features(norm_t)
-        real_tucker_out = self.real_tucker(t)
-        complex_tucker_out = self.complex_tucker(t)
-        if zero_real_tucker:
-            real_tucker_out = torch.zeros_like(real_tucker_out)
-        if zero_complex_tucker:
-            complex_tucker_out = torch.zeros_like(complex_tucker_out)
-        if zero_feature_grid:
-            grid_out = torch.zeros_like(grid_out)
-        base_input = torch.cat([grid_out, real_tucker_out, complex_tucker_out], dim=1)
-        base_input = self.groupnorm(base_input)
+    def forward(self, norm_t, noise_op=None, zero_real_tucker=False, zero_complex_tucker=False, zero_feature_grid=False, return_operators=False):
+        if type(norm_t) is not torch.Tensor:
+            norm_t = torch.tensor([norm_t], device=self.grid_features.grid.device, dtype=torch.float32)
+        mask_prev = (norm_t >= self.dT)
+        norm_t_prev = (norm_t[mask_prev] - self.dT) if mask_prev.any() else None
+        mask_next = (norm_t <= (1 - self.dT))
+        norm_t_next = (norm_t[mask_next] + self.dT) if mask_next.any() else None
 
-        prev_frames = torch.zeros_like(base_input)
-        next_frames = torch.zeros_like(base_input)
+        if not hasattr(self, "_zero_base"):
+            self.register_buffer(
+            "_zero_base",
+            torch.zeros(1, self.C, self.H, self.W, device=norm_t.device, dtype=torch.float32),
+            persistent=False,
+            )
 
-        mask_prev = (t > 0)
+        zero_base = self._zero_base.expand(norm_t.shape[0], -1, -1, -1)
 
-        if mask_prev.any():
-            t_prev = (t[mask_prev] - 1)
-            norm_t_prev = t_prev / (self.T - 1)
-            grid_prev = self.grid_features(norm_t_prev)
-            real_prev = self.real_tucker(t_prev)
-            complex_prev = self.complex_tucker(t_prev)
-            if zero_real_tucker:
-                real_prev = torch.zeros_like(real_prev)
-            if zero_complex_tucker:
-                complex_prev = torch.zeros_like(complex_prev)
-            if zero_feature_grid:
-                grid_prev = torch.zeros_like(grid_prev)
-            base_prev = torch.cat([grid_prev, real_prev, complex_prev], dim=1)
-            base_prev = self.groupnorm(base_prev)
-            prev_frames[mask_prev] = base_prev
-        forward_prediction = self.forward_operator(prev_frames, norm_t_prev)
+        prev_real_tucker, curr_real_tucker, next_real_tucker = zero_base, zero_base, zero_base
+        prev_complex_tucker, curr_complex_tucker, next_complex_tucker = zero_base, zero_base, zero_base
+        prev_grid, curr_grid, next_grid = zero_base, zero_base, zero_base
 
-        mask_next = (t < (self.T - 1))
-        if mask_next.any():
-            t_next = (t[mask_next] + 1)
-            norm_t_next = t_next / (self.T - 1)
-            grid_next = self.grid_features(norm_t_next)
-            real_next = self.real_tucker(t_next)
-            complex_next = self.complex_tucker(t_next)
-            if zero_real_tucker:
-                real_next = torch.zeros_like(real_next)
-            if zero_complex_tucker:
-                complex_next = torch.zeros_like(complex_next)
-            if zero_feature_grid:
-                grid_next = torch.zeros_like(grid_next)
-            base_next = torch.cat([grid_next, real_next, complex_next], dim=1)
-            base_next = self.groupnorm(base_next)
-            next_frames[mask_next] = base_next
-        backward_prediction = self.backward_operator(next_frames, norm_t_next)
+        if not zero_real_tucker:
+            prev_real_tucker = self.real_tucker(norm_t_prev)
+            curr_real_tucker = self.real_tucker(norm_t)
+            next_real_tucker = self.real_tucker(norm_t_next)
+        if not zero_complex_tucker:
+            prev_complex_tucker = self.complex_tucker(norm_t_prev)
+            curr_complex_tucker = self.complex_tucker(norm_t)
+            next_complex_tucker = self.complex_tucker(norm_t_next)
+        if not zero_feature_grid:
+            prev_grid = self.grid_features(norm_t_prev)
+            curr_grid = self.grid_features(norm_t)
+            next_grid = self.grid_features(norm_t_next)
 
-        aggregated = base_input + forward_prediction + backward_prediction
+        prev_base = torch.cat([prev_grid, prev_real_tucker, prev_complex_tucker], dim=1)
+        prev_base = self.groupnorm(prev_base)
 
-        refined = self.upres(aggregated, t)
+        current_base = torch.cat([curr_grid, curr_real_tucker, curr_complex_tucker], dim=1)
+        current_input = self.groupnorm(current_base)
+
+        next_base = torch.cat([next_grid, next_real_tucker, next_complex_tucker], dim=1)
+        next_input = self.groupnorm(next_base)
+
+        prev_frames = torch.zeros_like(current_input)
+        next_frames = torch.zeros_like(current_input)
+        prev_frames[mask_prev] = prev_base
+        next_frames[mask_next] = next_base
+
+        forward_prediction = self.forward_operator(torch.cat([prev_frames, current_input], dim=1), norm_t_prev)
+        backward_prediction = self.backward_operator(torch.cat([current_input, next_frames], dim=1), norm_t_next)
+
+        aggregated = current_input + forward_prediction + backward_prediction
+
+        refined = self.upres(aggregated)
         if return_operators:
-            refined_forward = self.upres(forward_prediction, t)
-            refined_backward = self.upres(backward_prediction, t)
+            refined_forward = self.upres(forward_prediction)
+            refined_backward = self.upres(backward_prediction)
             return refined, refined_forward, refined_backward
         return refined
 
@@ -539,7 +532,8 @@ def feature_test(vid, name, config, device):
             max_t = min((t + 1) * batch_size, vid.shape[0])
             batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
             t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
-            prediction = model(t_batch)
+            norm_t_batch = t_batch.float() / (vid.shape[0] - 1)
+            prediction = model(norm_t_batch)
             mse = F.mse_loss(prediction, batch_gt)
             psnr = -10.0 * torch.log10(mse + 1e-8)
             frame_loss = (-psnr).mean() / num_batches
@@ -568,9 +562,9 @@ def feature_test(vid, name, config, device):
 
 if __name__ == "__main__":
     device = "cuda:0"
-    name = "bunny"
+    name = "ready"
     torch.manual_seed(42)
-    vid = load_video_frames(f"static/benchmarks/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
