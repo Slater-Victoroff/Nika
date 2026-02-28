@@ -385,21 +385,25 @@ class NikaBlock(nn.Module):
         self.groupnorm = torch.compile(self.groupnorm)
 
         op_hdim = 64
-        self.forward_operator = ConvOperator(
-            in_channels = 6 * self.C,
-            out_channels = 3 * self.C,
-            h_dim = op_hdim,
-            device = device,
-        )
-        self.forward_operator = torch.compile(self.forward_operator)
+        self.operator_steps = 2
 
-        self.backward_operator = ConvOperator(
-            in_channels = 6 * self.C,
-            out_channels = 3 * self.C,
-            h_dim = op_hdim,
-            device = device,
-        )
-        self.backward_operator = torch.compile(self.backward_operator)
+        self.forward_operators = nn.ModuleList()
+        self.backward_operators = nn.ModuleList()
+        for _ in range(self.operator_steps):
+            fwd = ConvOperator(
+                in_channels=6 * self.C,
+                out_channels=3 * self.C,
+                h_dim=op_hdim,
+                device=device,
+            )
+            bwd = ConvOperator(
+                in_channels=6 * self.C,
+                out_channels=3 * self.C,
+                h_dim=op_hdim,
+                device=device,
+            )
+            self.forward_operators.append(torch.compile(fwd))
+            self.backward_operators.append(torch.compile(bwd))
 
         self.upres = BasicUpres(
             in_channels=3 * self.C,
@@ -417,71 +421,80 @@ class NikaBlock(nn.Module):
         complex_tucker_params = sum(p.numel() for p in self.complex_tucker.parameters())
         grid_params = sum(p.numel() for p in self.grid_features.parameters())
         upres_params = sum(p.numel() for p in self.upres.parameters())
-        operator_params = sum(p.numel() for p in self.forward_operator.parameters()) + sum(p.numel() for p in self.backward_operator.parameters())
+        operator_params = sum(p.numel() for p in self.forward_operators.parameters()) + sum(p.numel() for p in self.backward_operators.parameters())
         total_params = real_tucker_params + complex_tucker_params + grid_params + upres_params + operator_params
         print(f"NikaBlock parameters:")
         print(f"  Real Tucker:     {real_tucker_params / 1e6:.3f}M")
         print(f"  Complex Tucker:  {complex_tucker_params / 1e6:.3f}M")
         print(f"  Feature Grid:    {grid_params / 1e6:.3f}M")
-        print(f"  Forward Operator:{sum(p.numel() for p in self.forward_operator.parameters()) / 1e6:.3f}M")
-        print(f"  Backward Operator:{sum(p.numel() for p in self.backward_operator.parameters()) / 1e6:.3f}M")
+        print(f"  Forward Operator:{sum(p.numel() for p in self.forward_operators.parameters()) / 1e6:.3f}M")
+        print(f"  Backward Operator:{sum(p.numel() for p in self.backward_operators.parameters()) / 1e6:.3f}M")
         print(f"  Upsampling CNN:  {upres_params / 1e6:.3f}M")
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
     def forward(self, norm_t, noise_op=None, zero_real_tucker=False, zero_complex_tucker=False, zero_feature_grid=False, return_operators=False):
         if type(norm_t) is not torch.Tensor:
             norm_t = torch.tensor([norm_t], device=self.grid_features.grid.device, dtype=torch.float32)
-        mask_prev = (norm_t >= self.dT)
-        norm_t_prev = (norm_t[mask_prev] - self.dT) if mask_prev.any() else None
-        mask_next = (norm_t <= (1 - self.dT))
-        norm_t_next = (norm_t[mask_next] + self.dT) if mask_next.any() else None
 
         if not hasattr(self, "_zero_base"):
             self.register_buffer(
             "_zero_base",
             torch.zeros(1, self.C, self.H, self.W, device=norm_t.device, dtype=torch.float32),
             persistent=False,
-            )
+        )
 
         zero_base = self._zero_base.expand(norm_t.shape[0], -1, -1, -1)
-
-        prev_real_tucker, curr_real_tucker, next_real_tucker = zero_base, zero_base, zero_base
-        prev_complex_tucker, curr_complex_tucker, next_complex_tucker = zero_base, zero_base, zero_base
-        prev_grid, curr_grid, next_grid = zero_base, zero_base, zero_base
-
-        if not zero_real_tucker:
-            prev_real_tucker = self.real_tucker(norm_t_prev)
-            curr_real_tucker = self.real_tucker(norm_t)
-            next_real_tucker = self.real_tucker(norm_t_next)
-        if not zero_complex_tucker:
-            prev_complex_tucker = self.complex_tucker(norm_t_prev)
-            curr_complex_tucker = self.complex_tucker(norm_t)
-            next_complex_tucker = self.complex_tucker(norm_t_next)
-        if not zero_feature_grid:
-            prev_grid = self.grid_features(norm_t_prev)
-            curr_grid = self.grid_features(norm_t)
-            next_grid = self.grid_features(norm_t_next)
-
-        prev_base = torch.cat([prev_grid, prev_real_tucker, prev_complex_tucker], dim=1)
-        prev_base = self.groupnorm(prev_base)
-
+        curr_real_tucker = self.real_tucker(norm_t) if not zero_real_tucker else zero_base
+        curr_complex_tucker = self.complex_tucker(norm_t) if not zero_complex_tucker else zero_base
+        curr_grid = self.grid_features(norm_t) if not zero_feature_grid else zero_base
         current_base = torch.cat([curr_grid, curr_real_tucker, curr_complex_tucker], dim=1)
         current_input = self.groupnorm(current_base)
 
-        next_base = torch.cat([next_grid, next_real_tucker, next_complex_tucker], dim=1)
-        next_input = self.groupnorm(next_base)
+        operator_residual = torch.zeros_like(current_input)
+        for i in range(self.operator_steps):
+            step_len = (i + 1) * self.dT
+            mask_prev = (norm_t >= step_len)
+            norm_t_prev = (norm_t[mask_prev] - step_len) if mask_prev.any() else None
+            mask_next = (norm_t <= (1 - step_len))
+            norm_t_next = (norm_t[mask_next] + step_len) if mask_next.any() else None
 
-        prev_frames = torch.zeros_like(current_input)
-        next_frames = torch.zeros_like(current_input)
-        prev_frames[mask_prev] = prev_base
-        next_frames[mask_next] = next_base
+            prev_real_tucker, next_real_tucker = zero_base, zero_base
+            prev_complex_tucker, next_complex_tucker = zero_base, zero_base
+            prev_grid, next_grid = zero_base, zero_base
 
-        forward_prediction = self.forward_operator(torch.cat([prev_frames, current_input], dim=1), norm_t_prev)
-        backward_prediction = self.backward_operator(torch.cat([current_input, next_frames], dim=1), norm_t_next)
+            if not zero_real_tucker:
+                prev_real_tucker = self.real_tucker(norm_t_prev) if mask_prev.any() else zero_base
+                next_real_tucker = self.real_tucker(norm_t_next) if mask_next.any() else zero_base
+            
+            if not zero_complex_tucker:
+                prev_complex_tucker = self.complex_tucker(norm_t_prev) if mask_prev.any() else zero_base
+                next_complex_tucker = self.complex_tucker(norm_t_next) if mask_next.any() else zero_base
+            
+            if not zero_feature_grid:
+                prev_grid = self.grid_features(norm_t_prev) if mask_prev.any() else zero_base
+                next_grid = self.grid_features(norm_t_next) if mask_next.any() else zero_base
+            
+            prev_base = torch.cat([prev_grid, prev_real_tucker, prev_complex_tucker], dim=1)
+            prev_base = self.groupnorm(prev_base)
+            prev_frames = torch.zeros_like(current_input)
+            prev_frames[mask_prev] = prev_base
+            forward_operator = self.forward_operators[i]
+            if mask_prev.any():
+                forward_prediction = forward_operator(torch.cat([prev_frames, current_input], dim=1), norm_t_prev)
+                operator_residual += forward_prediction
 
-        aggregated = current_input + forward_prediction + backward_prediction
+            next_base = torch.cat([next_grid, next_real_tucker, next_complex_tucker], dim=1)
+            next_base = self.groupnorm(next_base)
+            next_frames = torch.zeros_like(current_input)
+            next_frames[mask_next] = next_base
+            backward_operator = self.backward_operators[i]
+            if mask_next.any():
+                backward_prediction = backward_operator(torch.cat([current_input, next_frames], dim=1), norm_t_next)
+                operator_residual += backward_prediction
 
+        aggregated = current_input + operator_residual
         refined = self.upres(aggregated)
+
         if return_operators:
             refined_forward = self.upres(forward_prediction)
             refined_backward = self.upres(backward_prediction)
@@ -507,7 +520,7 @@ class NikaBlock(nn.Module):
 
 
 def feature_test(vid, name, config, device):
-    batch_size = 10
+    batch_size = 6
     model_kwargs = REFERENCES[config]
     model = NikaBlock(
         target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
@@ -562,9 +575,9 @@ def feature_test(vid, name, config, device):
 
 if __name__ == "__main__":
     device = "cuda:0"
-    name = "ready"
+    name = "bunny"
     torch.manual_seed(42)
-    vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    vid = load_video_frames(f"static/benchmarks/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
