@@ -13,8 +13,8 @@ REFERENCES = {
     },
     "small": {
         "grid_ranks": [4, 270, 480, 1],
-        "real_tucker_ranks": [3, 80, 80, 70],
-        "complex_tucker_ranks": [3, 60, 60, 50],
+        "real_tucker_ranks": [3, 70, 70, 70],
+        "complex_tucker_ranks": [3, 50, 50, 50],
         "conv_hidden": 48,
     },
     "small-shake": {

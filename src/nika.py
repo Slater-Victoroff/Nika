@@ -183,6 +183,69 @@ class ComplexTucker(RealTucker):
         return real_tucker.contiguous()
 
 
+def padded_size(H: int, P: int, S: int) -> int:
+    if H <= P:
+        return P
+    n = (H - P + S - 1) // S  # ceil((H-P)/S)
+    return n * S + P
+
+
+class GaborTucker(nn.Module):
+    def __init__(self, target_size, patch_size=16, time_ranks=8, spatial_ranks=4, device='cuda'):
+        super().__init__()
+        self.C, self.H, self.W, self.T = target_size
+        self.P = patch_size
+        self.stride = self.P // 2
+
+        self.t_mod = TuckerFactor(self.T, time_ranks, is_complex=False, device=device)
+        self.Hpad = padded_size(self.H, self.P, self.stride)
+        self.Wpad = padded_size(self.W, self.P, self.stride)
+
+        self.n_patches_h = (self.Hpad - self.P) // self.stride + 1
+        self.n_patches_w = (self.Wpad - self.P) // self.stride + 1
+        self.n_patches = self.n_patches_h * self.n_patches_w
+
+        self.h_bank = nn.Parameter(torch.randn(self.C, spatial_ranks, self.P, device=device) * 1e-2)
+        self.w_bank = nn.Parameter(torch.randn(self.C, spatial_ranks, self.P, device=device) * 1e-2)
+        self.patch_coeffs = nn.Parameter(torch.randn(self.n_patches, 2, spatial_ranks, time_ranks, device=device) * 1e-2)
+
+        w = torch.hann_window(self.P, periodic=False, device=device)
+        self.hann_window_2d = torch.outer(w, w)
+        win2 = (self.hann_window_2d * self.hann_window_2d).reshape(1, self.P * self.P, 1).repeat(1, 1, self.n_patches)
+        denom = F.fold(
+            win2,
+            output_size=(self.Hpad, self.Wpad),
+            kernel_size=(self.P, self.P),
+            stride=(self.stride, self.stride),
+        )
+
+        self.register_buffer("denom", denom.clamp_min(1e-6), persistent=False)
+    
+    def forward(self, t):
+        t_emb = self.t_mod.get(t)
+        B, rT = t_emb.shape
+        
+        coeff_reim = torch.einsum("pnrt, bt -> bpnr", self.patch_coeffs, t_emb)
+        coeff = torch.complex(coeff_reim[:, :, 0, :], coeff_reim[:, :, 1, :])
+        atoms = torch.einsum("crp,crq->crpq", self.h_bank, self.w_bank)
+        atoms_c = torch.complex(atoms, torch.zeros_like(atoms))
+        spec = torch.einsum("crpq,bnr->bcnpq", atoms_c, coeff)
+
+        patches = torch.fft.ifft2(spec, dim=(-2, -1), norm='ortho').real
+        windowed_patches = torch.einsum("bcnpq,pq->bcnpq", patches, self.hann_window_2d)
+        permuted_patches = windowed_patches.permute(0, 1, 3, 4, 2)  # [B, C, P, P, N]
+        unfolded_patches = permuted_patches.contiguous().view(B, self.C * self.P * self.P, self.n_patches)
+
+        folded = F.fold(
+            unfolded_patches,
+            output_size=(self.Hpad, self.Wpad),
+            kernel_size=(self.P, self.P),
+            stride=(self.stride, self.stride),
+        )
+        normalized = folded / self.denom
+        return normalized[:, :, :self.H, :self.W].contiguous()
+        
+
 def grid_sample_base(H, W, device):
     y_lin = torch.arange(0, H, device=device)
     x_lin = torch.arange(0, W, device=device)
@@ -381,7 +444,16 @@ class NikaBlock(nn.Module):
         )
         self.grid_features = torch.compile(self.grid_features)
 
-        self.groupnorm = nn.GroupNorm(num_groups=3, num_channels=3 * self.C).to(device)
+        self.gabor_tucker = GaborTucker(
+            target_size=self.internal_shape,
+            patch_size=16,
+            time_ranks=16,
+            spatial_ranks=16,
+            device=device,
+        )
+        self.gabor_tucker = torch.compile(self.gabor_tucker)
+
+        self.groupnorm = nn.GroupNorm(num_groups=4, num_channels=4 * self.C).to(device)
         self.groupnorm = torch.compile(self.groupnorm)
 
         op_hdim = 64
@@ -391,14 +463,14 @@ class NikaBlock(nn.Module):
         self.backward_operators = nn.ModuleList()
         for _ in range(self.operator_steps):
             fwd = ConvOperator(
-                in_channels=6 * self.C,
-                out_channels=3 * self.C,
+                in_channels=8 * self.C,
+                out_channels=4 * self.C,
                 h_dim=op_hdim,
                 device=device,
             )
             bwd = ConvOperator(
-                in_channels=6 * self.C,
-                out_channels=3 * self.C,
+                in_channels=8 * self.C,
+                out_channels=4 * self.C,
                 h_dim=op_hdim,
                 device=device,
             )
@@ -406,7 +478,7 @@ class NikaBlock(nn.Module):
             self.backward_operators.append(torch.compile(bwd))
 
         self.upres = BasicUpres(
-            in_channels=3 * self.C,
+            in_channels=4 * self.C,
             out_channels=out_channels,
             hidden=conv_hidden,
             k=k,    
@@ -420,13 +492,15 @@ class NikaBlock(nn.Module):
         real_tucker_params = sum(p.numel() for p in self.real_tucker.parameters())
         complex_tucker_params = sum(p.numel() for p in self.complex_tucker.parameters())
         grid_params = sum(p.numel() for p in self.grid_features.parameters())
+        gabor_params = sum(p.numel() for p in self.gabor_tucker.parameters())
         upres_params = sum(p.numel() for p in self.upres.parameters())
         operator_params = sum(p.numel() for p in self.forward_operators.parameters()) + sum(p.numel() for p in self.backward_operators.parameters())
-        total_params = real_tucker_params + complex_tucker_params + grid_params + upres_params + operator_params
+        total_params = real_tucker_params + complex_tucker_params + grid_params + gabor_params + upres_params + operator_params
         print(f"NikaBlock parameters:")
         print(f"  Real Tucker:     {real_tucker_params / 1e6:.3f}M")
         print(f"  Complex Tucker:  {complex_tucker_params / 1e6:.3f}M")
         print(f"  Feature Grid:    {grid_params / 1e6:.3f}M")
+        print(f"  Gabor Tucker:    {gabor_params / 1e6:.3f}M")
         print(f"  Forward Operator:{sum(p.numel() for p in self.forward_operators.parameters()) / 1e6:.3f}M")
         print(f"  Backward Operator:{sum(p.numel() for p in self.backward_operators.parameters()) / 1e6:.3f}M")
         print(f"  Upsampling CNN:  {upres_params / 1e6:.3f}M")
@@ -447,7 +521,8 @@ class NikaBlock(nn.Module):
         curr_real_tucker = self.real_tucker(norm_t) if not zero_real_tucker else zero_base
         curr_complex_tucker = self.complex_tucker(norm_t) if not zero_complex_tucker else zero_base
         curr_grid = self.grid_features(norm_t) if not zero_feature_grid else zero_base
-        current_base = torch.cat([curr_grid, curr_real_tucker, curr_complex_tucker], dim=1)
+        curr_gabor = self.gabor_tucker(norm_t)
+        current_base = torch.cat([curr_grid, curr_real_tucker, curr_complex_tucker, curr_gabor], dim=1)
         current_input = self.groupnorm(current_base)
 
         operator_residual = torch.zeros_like(current_input)
@@ -474,7 +549,10 @@ class NikaBlock(nn.Module):
                 prev_grid = self.grid_features(norm_t_prev) if mask_prev.any() else zero_base
                 next_grid = self.grid_features(norm_t_next) if mask_next.any() else zero_base
             
-            prev_base = torch.cat([prev_grid, prev_real_tucker, prev_complex_tucker], dim=1)
+            prev_gabor = self.gabor_tucker(norm_t_prev) if mask_prev.any() else zero_base
+            next_gabor = self.gabor_tucker(norm_t_next) if mask_next.any() else zero_base
+
+            prev_base = torch.cat([prev_grid, prev_real_tucker, prev_complex_tucker, prev_gabor], dim=1)
             prev_base = self.groupnorm(prev_base)
             prev_frames = torch.zeros_like(current_input)
             prev_frames[mask_prev] = prev_base
@@ -483,7 +561,7 @@ class NikaBlock(nn.Module):
                 forward_prediction = forward_operator(torch.cat([prev_frames, current_input], dim=1), norm_t_prev)
                 operator_residual += forward_prediction
 
-            next_base = torch.cat([next_grid, next_real_tucker, next_complex_tucker], dim=1)
+            next_base = torch.cat([next_grid, next_real_tucker, next_complex_tucker, next_gabor], dim=1)
             next_base = self.groupnorm(next_base)
             next_frames = torch.zeros_like(current_input)
             next_frames[mask_next] = next_base
