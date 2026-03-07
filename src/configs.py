@@ -17,6 +17,18 @@ REFERENCES = {
         "complex_tucker_ranks": [3, 60, 60, 50],
         "conv_hidden": 48,
     },
+    "scratch": {
+        "grid_ranks": [4, 270, 480, 1],
+        "real_tucker_ranks": [3, 75, 75, 60],
+        "complex_tucker_ranks": [3, 60, 60, 40],
+        "conv_hidden": 48,
+    },
+    "scratch2": {
+        "grid_ranks": [4, 270, 480, 1],
+        "real_tucker_ranks": [3, 80, 80, 70],
+        "complex_tucker_ranks": [3, 60, 60, 50],
+        "conv_hidden": 48,
+    },
     "small-shake": {
         # "grid_ranks": [2, 133, 169, 23],
         "grid_ranks": [4, 270, 480, 1],

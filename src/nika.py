@@ -21,27 +21,6 @@ from encoding_utils import FourierEncoding
 from configs import REFERENCES
 
 
-def hermitian_project_shifted(Ks):
-    B, C, kh, kw = Ks.shape
-    Ku = torch.fft.ifftshift(Ks, dim=(-2, -1))
-    # Partner mapping in UNshifted coords is i → (-i mod k), which equals flip + roll(+1)
-    partner = torch.roll(
-        torch.roll(torch.flip(Ku, dims=(-2, -1)), shifts=1, dims=-2),
-        shifts=1, dims=-1
-    ).conj()
-
-    Ksym = 0.5 * (Ku + partner)
-
-    # Force self-conjugate bins to be real
-    Ksym[..., 0, 0] = Ksym[..., 0, 0].real + 0j
-    if kw % 2 == 0:
-        mid = kw // 2
-        Ksym[..., 0,  mid] = Ksym[..., 0,  mid].real + 0j
-        Ksym[..., mid, 0 ] = Ksym[..., mid, 0 ].real + 0j
-        Ksym[..., mid, mid] = Ksym[..., mid, mid].real + 0j
-    return torch.fft.fftshift(Ksym, dim=(-2, -1))  # back to SHIFTED
-
-
 class TuckerFactor(nn.Module):
     def __init__(self, target_dim, rank, is_complex=False, base_mag=1e-2, device='cuda'):
         """
@@ -162,14 +141,17 @@ class ComplexTucker(RealTucker):
 
     def __init__(self, target_shape, ranks, device='cuda'):
         super().__init__(target_shape, ranks, device=device)
+        half_W = (self.W // 2) + 1
         self.UH = TuckerFactor(self.H, self.rH, is_complex=True, device=device)
-        self.UW = TuckerFactor(self.W, self.rW, is_complex=True, device=device)
+        self.UW = TuckerFactor(half_W, self.rW, is_complex=True, device=device)
         self.UC = TuckerFactor(self.C, self.rC, is_complex=True, device=device)
         self.UT = TuckerFactor(self.T, self.rT, is_complex=True, device=device)
 
         self.G = None  # override parent
         self.G_real = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
         self.G_imag = nn.Parameter(torch.zeros(self.rT, self.rC, self.rH, self.rW, device=device))
+
+        self.feature_grid = FeatureGrid([self.C * 2, self.H, half_W, self.T], grid_res=[self.C * 2, self.H, half_W, 1], device=device)
 
     def forward(self, t):
         UH = self.UH()
@@ -178,8 +160,11 @@ class ComplexTucker(RealTucker):
         UT = self.UT.get(t)
         G = torch.complex(self.G_real, self.G_imag)
         construct = tucker_construct(UT, UC, UH, UW, G)
-        base = hermitian_project_shifted(construct)
-        real_tucker = torch.fft.ifft2(base, norm='ortho').real
+
+        grid = self.feature_grid(t)
+        complex_grid = torch.complex(*grid.chunk(2, dim=1))
+        construct = construct * complex_grid
+        real_tucker = torch.fft.irfft2(construct, norm='ortho').real
         return real_tucker.contiguous()
 
 
@@ -367,13 +352,6 @@ class NikaBlock(nn.Module):
         )
         self.real_tucker = torch.compile(self.real_tucker)
 
-        self.complex_tucker = ComplexTucker(
-            target_shape=self.internal_shape,
-            ranks=complex_tucker_ranks,
-            device=device,
-        )
-        # Can't compile complex stuff
-
         self.grid_features = FeatureGrid(
             target_shape=self.internal_shape,
             grid_res=grid_ranks,
@@ -381,7 +359,15 @@ class NikaBlock(nn.Module):
         )
         self.grid_features = torch.compile(self.grid_features)
 
-        self.groupnorm = nn.GroupNorm(num_groups=3, num_channels=3 * self.C).to(device)
+        self.complex_tucker = ComplexTucker(
+            target_shape=self.internal_shape,
+            ranks=complex_tucker_ranks,
+            device=device,
+        )
+
+        self.n_heads = 3
+
+        self.groupnorm = nn.GroupNorm(num_groups=self.n_heads, num_channels=self.n_heads * self.C).to(device)
         self.groupnorm = torch.compile(self.groupnorm)
 
         op_hdim = 64
@@ -391,26 +377,26 @@ class NikaBlock(nn.Module):
         self.backward_operators = nn.ModuleList()
         for _ in range(self.operator_steps):
             fwd = ConvOperator(
-                in_channels=6 * self.C,
-                out_channels=3 * self.C,
-                h_dim=op_hdim,
-                device=device,
+                in_channels = 2 * self.n_heads * self.C,
+                out_channels = self.n_heads * self.C,
+                h_dim = op_hdim,
+                device = device,
             )
             bwd = ConvOperator(
-                in_channels=6 * self.C,
-                out_channels=3 * self.C,
-                h_dim=op_hdim,
-                device=device,
+                in_channels = 2 * self.n_heads * self.C,
+                out_channels = self.n_heads * self.C,
+                h_dim = op_hdim,
+                device = device,
             )
             self.forward_operators.append(torch.compile(fwd))
             self.backward_operators.append(torch.compile(bwd))
 
         self.upres = BasicUpres(
-            in_channels=3 * self.C,
-            out_channels=out_channels,
-            hidden=conv_hidden,
-            k=k,    
-            device=device,
+            in_channels = (self.n_heads + 1) * self.C,
+            out_channels = out_channels,
+            hidden = conv_hidden,
+            k = k,    
+            device = device,
         )
         self.upres = torch.compile(self.upres)
 
@@ -445,9 +431,10 @@ class NikaBlock(nn.Module):
 
         zero_base = self._zero_base.expand(norm_t.shape[0], -1, -1, -1)
         curr_real_tucker = self.real_tucker(norm_t) if not zero_real_tucker else zero_base
+        curr_real_grid = self.grid_features(norm_t) if not zero_feature_grid else zero_base
         curr_complex_tucker = self.complex_tucker(norm_t) if not zero_complex_tucker else zero_base
-        curr_grid = self.grid_features(norm_t) if not zero_feature_grid else zero_base
-        current_base = torch.cat([curr_grid, curr_real_tucker, curr_complex_tucker], dim=1)
+
+        current_base = torch.cat([curr_real_grid, curr_real_tucker, curr_complex_tucker], dim=1)
         current_input = self.groupnorm(current_base)
 
         operator_residual = torch.zeros_like(current_input)
@@ -466,16 +453,17 @@ class NikaBlock(nn.Module):
                 prev_real_tucker = self.real_tucker(norm_t_prev) if mask_prev.any() else zero_base
                 next_real_tucker = self.real_tucker(norm_t_next) if mask_next.any() else zero_base
             
-            if not zero_complex_tucker:
-                prev_complex_tucker = self.complex_tucker(norm_t_prev) if mask_prev.any() else zero_base
-                next_complex_tucker = self.complex_tucker(norm_t_next) if mask_next.any() else zero_base
-            
             if not zero_feature_grid:
                 prev_grid = self.grid_features(norm_t_prev) if mask_prev.any() else zero_base
                 next_grid = self.grid_features(norm_t_next) if mask_next.any() else zero_base
-            
+
+            if not zero_complex_tucker:
+                prev_complex_tucker = self.complex_tucker(norm_t_prev) if mask_prev.any() else zero_base
+                next_complex_tucker = self.complex_tucker(norm_t_next) if mask_next.any() else zero_base
+
             prev_base = torch.cat([prev_grid, prev_real_tucker, prev_complex_tucker], dim=1)
             prev_base = self.groupnorm(prev_base)
+
             prev_frames = torch.zeros_like(current_input)
             prev_frames[mask_prev] = prev_base
             forward_operator = self.forward_operators[i]
@@ -581,4 +569,4 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    feature_test(vid, name, f"small", device=device)
+    feature_test(vid, name, f"scratch", device=device)
