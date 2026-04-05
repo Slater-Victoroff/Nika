@@ -8,7 +8,6 @@ To reproduce the UVG results with Docker from the repo root:
 ```bash
 docker compose build
 docker compose run --rm backend bash
-python3 -m pip install py7zr
 python3 scripts/prepare_uvg.py
 bash scripts/reproduce_uvg_scale.sh small
 ```

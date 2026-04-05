@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Batch-training wrapper for running one Nika config across the standard UVG sequences.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

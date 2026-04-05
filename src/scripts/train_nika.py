@@ -21,6 +21,11 @@ from nika import feature_test
 
 
 def parse_args() -> argparse.Namespace:
+    """Build and parse the CLI arguments for single-sequence training.
+
+    Returns:
+        The parsed command-line namespace.
+    """
     parser = argparse.ArgumentParser(description="Train NIKA on one frame folder")
     parser.add_argument("--dataset-root", default="static/benchmarks/uvg")
     parser.add_argument("--video", required=True, help="Frame folder name, e.g. beauty")
@@ -31,6 +36,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Load one dataset folder and invoke the existing training entrypoint.
+
+    Returns:
+        Process exit status code.
+    """
     args = parse_args()
     video_dir = Path(args.dataset_root) / args.video
     if not video_dir.is_dir():

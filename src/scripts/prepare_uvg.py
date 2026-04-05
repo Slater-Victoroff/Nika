@@ -31,52 +31,57 @@ SEQUENCES = {
         "height": 1080,
         "fps": 120,
     },
-    "bosphorus": {
-        "archive": "Bosphorus_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "url": "https://ultravideo.fi/video/Bosphorus_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "width": 1920,
-        "height": 1080,
-        "fps": 120,
-    },
-    "honey": {
-        "archive": "HoneyBee_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "url": "https://ultravideo.fi/video/HoneyBee_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "width": 1920,
-        "height": 1080,
-        "fps": 120,
-    },
-    "jockey": {
-        "archive": "Jockey_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "url": "https://ultravideo.fi/video/Jockey_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "width": 1920,
-        "height": 1080,
-        "fps": 120,
-    },
-    "ready": {
-        "archive": "ReadySetGo_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "url": "https://ultravideo.fi/video/ReadySetGo_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "width": 1920,
-        "height": 1080,
-        "fps": 120,
-    },
-    "shake": {
-        "archive": "ShakeNDry_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "url": "https://ultravideo.fi/video/ShakeNDry_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "width": 1920,
-        "height": 1080,
-        "fps": 120,
-    },
-    "yacht": {
-        "archive": "YachtRide_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "url": "https://ultravideo.fi/video/YachtRide_1920x1080_120fps_420_8bit_YUV_RAW.7z",
-        "width": 1920,
-        "height": 1080,
-        "fps": 120,
-    },
+    # "bosphorus": {
+    #     "archive": "Bosphorus_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "url": "https://ultravideo.fi/video/Bosphorus_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "width": 1920,
+    #     "height": 1080,
+    #     "fps": 120,
+    # },
+    # "honey": {
+    #     "archive": "HoneyBee_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "url": "https://ultravideo.fi/video/HoneyBee_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "width": 1920,
+    #     "height": 1080,
+    #     "fps": 120,
+    # },
+    # "jockey": {
+    #     "archive": "Jockey_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "url": "https://ultravideo.fi/video/Jockey_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "width": 1920,
+    #     "height": 1080,
+    #     "fps": 120,
+    # },
+    # "ready": {
+    #     "archive": "ReadySetGo_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "url": "https://ultravideo.fi/video/ReadySetGo_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "width": 1920,
+    #     "height": 1080,
+    #     "fps": 120,
+    # },
+    # "shake": {
+    #     "archive": "ShakeNDry_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "url": "https://ultravideo.fi/video/ShakeNDry_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "width": 1920,
+    #     "height": 1080,
+    #     "fps": 120,
+    # },
+    # "yacht": {
+    #     "archive": "YachtRide_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "url": "https://ultravideo.fi/video/YachtRide_1920x1080_120fps_420_8bit_YUV_RAW.7z",
+    #     "width": 1920,
+    #     "height": 1080,
+    #     "fps": 120,
+    # },
 }
 
 
 def parse_args() -> argparse.Namespace:
+    """Build and parse CLI arguments for UVG dataset preparation.
+
+    Returns:
+        The parsed command-line namespace.
+    """
     parser = argparse.ArgumentParser(description="Prepare UVG PNG frame folders")
     parser.add_argument("--dataset-root", default="static/benchmarks/uvg")
     parser.add_argument("--downloads-dir", default="static/downloads/uvg")
@@ -92,6 +97,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def ensure_runtime_dependencies(ffmpeg_bin: str) -> None:
+    """Validate that extraction and conversion dependencies are available.
+
+    Args:
+        ffmpeg_bin: Name or path of the ffmpeg executable to require.
+    """
     if py7zr is None:
         raise RuntimeError(
             "py7zr is required for UVG extraction. Install it with: python3 -m pip install py7zr"
@@ -101,6 +111,12 @@ def ensure_runtime_dependencies(ffmpeg_bin: str) -> None:
 
 
 def download(url: str, destination: Path) -> None:
+    """Download an archive unless it already exists on disk.
+
+    Args:
+        url: Remote archive URL to download.
+        destination: Local path where the archive should be stored.
+    """
     if destination.exists():
         print(f"Using existing archive: {destination}")
         return
@@ -111,6 +127,15 @@ def download(url: str, destination: Path) -> None:
 
 
 def extract_yuv(archive_path: Path, extract_dir: Path) -> Path:
+    """Extract a downloaded UVG archive and return the contained YUV file path.
+
+    Args:
+        archive_path: Path to the downloaded ``.7z`` archive.
+        extract_dir: Directory where the archive contents should be expanded.
+
+    Returns:
+        Path to the extracted raw YUV video file.
+    """
     extract_dir.mkdir(parents=True, exist_ok=True)
     with py7zr.SevenZipFile(archive_path, mode="r") as archive:
         archive.extractall(path=extract_dir)
@@ -121,6 +146,16 @@ def extract_yuv(archive_path: Path, extract_dir: Path) -> Path:
 
 
 def yuv_to_png(yuv_path: Path, frame_dir: Path, width: int, height: int, fps: int, ffmpeg_bin: str) -> None:
+    """Convert one raw YUV sequence into the PNG frame layout expected by training.
+
+    Args:
+        yuv_path: Raw YUV input file.
+        frame_dir: Output directory for numbered PNG frames.
+        width: Frame width in pixels.
+        height: Frame height in pixels.
+        fps: Frame rate metadata passed to ffmpeg.
+        ffmpeg_bin: Name or path of the ffmpeg executable to run.
+    """
     if list(frame_dir.glob("*.png")):
         print(f"Using existing frames in {frame_dir}")
         return
@@ -145,6 +180,11 @@ def yuv_to_png(yuv_path: Path, frame_dir: Path, width: int, height: int, fps: in
 
 
 def main() -> int:
+    """Download, extract, and convert the selected UVG sequences.
+
+    Returns:
+        Process exit status code.
+    """
     args = parse_args()
     ensure_runtime_dependencies(args.ffmpeg_bin)
 

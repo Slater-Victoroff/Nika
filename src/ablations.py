@@ -1,3 +1,5 @@
+"""Alternative Nika architecture variants used for ablation experiments."""
+
 import os
 import torch
 import torch.nn as nn
@@ -10,6 +12,17 @@ from configs import REFERENCES
 
 class RealNika(nn.Module):
     def __init__(self, target_shape, k, real_tucker_ranks, grid_ranks, conv_hidden, out_channels, device):
+        """Assemble the real-grid ablation model.
+
+        Args:
+            target_shape: Full ``[C, H, W, T]`` shape of the target video tensor.
+            k: Spatial downsampling and pixel-shuffle upsampling factor.
+            real_tucker_ranks: Tucker ranks for the real-domain factorization branch.
+            grid_ranks: Feature-grid resolution used for the learned spatial grid branch.
+            conv_hidden: Hidden width for the refinement CNN.
+            out_channels: Number of image channels to predict.
+            device: Device on which to allocate the module.
+        """
         super().__init__()
         self.C, self.H, self.W, self.T = target_shape
         self.H = int(self.H // k); self.W = int(self.W // k)
@@ -37,6 +50,7 @@ class RealNika(nn.Module):
         self.log_stats()
 
     def log_stats(self):
+        """Print a parameter-count breakdown for this ablation variant."""
         feature_grid_params = sum(p.numel() for p in self.feature_grid.parameters())
         real_tucker_params = sum(p.numel() for p in self.real_tucker.parameters())
         upres_params = sum(p.numel() for p in self.upres.parameters())
@@ -48,6 +62,14 @@ class RealNika(nn.Module):
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
     def forward(self, t):
+        """Predict frames for the requested time indices.
+
+        Args:
+            t: Scalar or tensor of frame indices to reconstruct.
+
+        Returns:
+            Predicted video frames for the requested times.
+        """
         if type(t) is not torch.Tensor:
             t = torch.tensor([t], device=self.real_tucker.grid.device, dtype=torch.int64)
         feature_grid_base = self.feature_grid(t)
@@ -61,6 +83,17 @@ class RealNika(nn.Module):
 
 class TuckerNika(nn.Module):
     def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, conv_hidden, out_channels, device):
+        """Assemble the Tucker-only ablation model.
+
+        Args:
+            target_shape: Full ``[C, H, W, T]`` shape of the target video tensor.
+            k: Spatial downsampling and pixel-shuffle upsampling factor.
+            real_tucker_ranks: Ranks for the real-domain Tucker branch.
+            complex_tucker_ranks: Ranks for the FFT-domain Tucker branch.
+            conv_hidden: Hidden width for the refinement CNN.
+            out_channels: Number of image channels to predict.
+            device: Device on which to allocate the module.
+        """
         super().__init__()
         self.C, self.H, self.W, self.T = target_shape
         self.H = int(self.H // k); self.W = int(self.W // k)
@@ -89,6 +122,7 @@ class TuckerNika(nn.Module):
         self.log_stats()
 
     def log_stats(self):
+        """Print a parameter-count breakdown for this ablation variant."""
         real_tucker_params = sum(p.numel() for p in self.real_tucker.parameters())
         complex_tucker_params = sum(p.numel() for p in self.complex_tucker.parameters())
         upres_params = sum(p.numel() for p in self.upres.parameters())
@@ -100,6 +134,14 @@ class TuckerNika(nn.Module):
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
     def forward(self, t):
+        """Predict frames using real and complex Tucker branches only.
+
+        Args:
+            t: Scalar or tensor of frame indices to reconstruct.
+
+        Returns:
+            Predicted video frames for the requested times.
+        """
         if type(t) is not torch.Tensor:
             t = torch.tensor([t], device=self.real_tucker.grid.device, dtype=torch.int64)
         real_tucker_out = self.real_tucker(t)
@@ -112,6 +154,17 @@ class TuckerNika(nn.Module):
 
 class WeirdNika(nn.Module):
     def __init__(self, target_shape, k, complex_tucker_ranks, conv_hidden, grid_ranks, out_channels, device):
+        """Assemble the feature-grid plus complex-Tucker ablation model.
+
+        Args:
+            target_shape: Full ``[C, H, W, T]`` shape of the target video tensor.
+            k: Spatial downsampling and pixel-shuffle upsampling factor.
+            complex_tucker_ranks: Ranks for the FFT-domain Tucker branch.
+            conv_hidden: Hidden width for the refinement CNN.
+            grid_ranks: Feature-grid resolution for the learned grid branch.
+            out_channels: Number of image channels to predict.
+            device: Device on which to allocate the module.
+        """
         super().__init__()
         self.C, self.H, self.W, self.T = target_shape
         self.H = int(self.H // k); self.W = int(self.W // k)
@@ -140,6 +193,7 @@ class WeirdNika(nn.Module):
         self.log_stats()
 
     def log_stats(self):
+        """Print a parameter-count breakdown for this ablation variant."""
         feature_grid_params = sum(p.numel() for p in self.feature_grid.parameters())
         complex_tucker_params = sum(p.numel() for p in self.complex_tucker.parameters())
         upres_params = sum(p.numel() for p in self.upres.parameters())
@@ -151,6 +205,14 @@ class WeirdNika(nn.Module):
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
     def forward(self, t):
+        """Predict frames using the feature-grid and complex-Tucker branches.
+
+        Args:
+            t: Scalar or tensor of frame indices to reconstruct.
+
+        Returns:
+            Predicted video frames for the requested times.
+        """
         if type(t) is not torch.Tensor:
             t = torch.tensor([t], device=self.feature_grid.grid.device, dtype=torch.int64)
         feature_grid_out = self.feature_grid(t)
@@ -163,6 +225,17 @@ class WeirdNika(nn.Module):
 
 class NoConvNika(nn.Module):
     def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, out_channels, device):
+        """Assemble the no-convolution ablation model.
+
+        Args:
+            target_shape: Full ``[C, H, W, T]`` shape of the target video tensor.
+            k: Spatial downsampling and pixel-shuffle upsampling factor.
+            real_tucker_ranks: Ranks for the real-domain Tucker branch.
+            complex_tucker_ranks: Ranks for the FFT-domain Tucker branch.
+            grid_ranks: Feature-grid resolution for the learned grid branch.
+            out_channels: Number of image channels to predict.
+            device: Device on which to allocate the module.
+        """
         super().__init__()
         self.C, self.H, self.W, self.T = target_shape
         self.H = int(self.H // k); self.W = int(self.W // k)
@@ -192,6 +265,7 @@ class NoConvNika(nn.Module):
         self.log_stats()
 
     def log_stats(self):
+        """Print a parameter-count breakdown for this ablation variant."""
         feature_grid_params = sum(p.numel() for p in self.feature_grid.parameters())
         real_tucker_params = sum(p.numel() for p in self.real_tucker.parameters())
         complex_tucker_params = sum(p.numel() for p in self.complex_tucker.parameters())
@@ -205,6 +279,14 @@ class NoConvNika(nn.Module):
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
     def forward(self, t):
+        """Predict frames using concatenated branches and a 1x1 upsampling head.
+
+        Args:
+            t: Scalar or tensor of frame indices to reconstruct.
+
+        Returns:
+            Predicted video frames for the requested times.
+        """
         if type(t) is not torch.Tensor:
             t = torch.tensor([t], device=self.feature_grid.grid.device, dtype=torch.int64)
         feature_grid_out = self.feature_grid(t)
@@ -216,6 +298,13 @@ class NoConvNika(nn.Module):
 
 
 def run_ablation(config, dataset_dir, device):
+    """Train one ablation variant on a fixed subset of benchmark sequences.
+
+    Args:
+        config: Key into ``REFERENCES`` selecting the ablation hyperparameters.
+        dataset_dir: Root directory containing the benchmark frame folders.
+        device: Device on which to run training and evaluation.
+    """
     # names = ["honey", "jockey", "ready"]
     names = ["ready", "shake", "yacht"]
     batch_size = 5

@@ -1,3 +1,4 @@
+# Docker Compose definition for the GPU-enabled Nika development container.
 services:
   backend:
     build:

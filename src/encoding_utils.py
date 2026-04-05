@@ -1,21 +1,35 @@
+"""Positional encoding helpers used by temporal conditioning modules."""
+
 import math
 
 import torch
 from torch import nn
 
 class FourierPositionalEncoding(nn.Module):
-    """
-    Implementation inspried by Kornia
-    """
+    """Project coordinates into a sinusoidal embedding basis."""
 
     def __init__(self, M: int, target_dim: int, gamma: float = 1.0) -> None:
+        """Initialize the random Fourier projection layer.
+
+        Args:
+            M: Input coordinate dimensionality.
+            target_dim: Size of the produced embedding vector.
+            gamma: Scale factor controlling the projection initialization variance.
+        """
         super().__init__()
         self.gamma = gamma
         self.Wr = nn.Linear(M, target_dim // 2, bias=False)
         nn.init.normal_(self.Wr.weight.data, mean=0, std=self.gamma**-2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode position vector."""
+        """Encode coordinates into concatenated cosine and sine features.
+
+        Args:
+            x: Coordinate tensor whose last dimension matches ``M``.
+
+        Returns:
+            A tensor whose last dimension is the configured positional embedding size.
+        """
         projected = self.Wr(x)
         cosines, sines = torch.cos(projected), torch.sin(projected)
         emb = torch.cat([cosines, sines], dim=-1)
@@ -32,6 +46,16 @@ class FourierEncoding(nn.Module):
         learnable_freqs:bool=True,
         device='cuda'
     ) -> None:
+        """Initialize a learnable 1D Fourier encoding module.
+
+        Args:
+            target_dim: Width of the generated encoding vector.
+            max_freq: Highest initial frequency magnitude before scaling by ``2π``.
+            freq_init: Strategy used to initialize the learnable frequencies.
+            include_raw: Whether to prepend the raw coordinate to the embedding.
+            learnable_freqs: Whether the frequency coefficients should be trainable.
+            device: Device on which to allocate the frequency parameters.
+        """
         super().__init__()
         self.target_dim = target_dim
         freq_dim = ((target_dim - int(include_raw)) // 2) + 1  # +1 for padding with odd target_dim
@@ -45,7 +69,14 @@ class FourierEncoding(nn.Module):
         self.include_raw = include_raw
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode position vector."""
+        """Encode scalar positions with sinusoidal features.
+
+        Args:
+            x: Input coordinate tensor to encode.
+
+        Returns:
+            A contiguous tensor truncated to ``target_dim`` features per position.
+        """
         x = x.unsqueeze(-1)  # (N, M, 1)
         projected = x * self.freqs
         cosines, sines = torch.cos(projected), torch.sin(projected)

@@ -13,14 +13,6 @@ docker compose run --rm backend bash
 
 Inside the container, the repo source is mounted at `/app`.
 
-If you want to prepare UVG inside that container, install one extra Python package first:
-
-```bash
-python3 -m pip install py7zr
-```
-
-That is only needed for extracting the official UVG `.7z` archives.
-
 ## UVG Dataset Access
 
 The paper draft refers to the standard 7-sequence UVG benchmark:
@@ -106,6 +98,69 @@ This prints:
 - average PSNR
 - decode FPS
 - elapsed decode time
+
+## Bunny Dataset Access
+
+The draft also reports results on the Big Buck Bunny benchmark, using a single
+1280x720 sequence with 132 frames.
+
+For the Bunny path, use `scikit-video`, which exposes a sample Big Buck Bunny
+video via `skvideo.datasets.bigbuckbunny()`.
+
+Reference:
+
+- scikit-video dataset helper: https://www.scikit-video.org/stable/modules/generated/skvideo.datasets.bigbuckbunny.html
+
+The helper script below uses that sample video path and extracts the first 132
+frames at 1280x720 into the layout expected by this repo.
+
+### Prepare Bunny
+
+From the repo root:
+
+```bash
+python3 src/scripts/prepare_bunny.py
+```
+
+Inside the Docker container:
+
+```bash
+python3 scripts/prepare_bunny.py
+```
+
+### Train Bunny
+
+Use the same training wrapper, but point `--dataset-root` at `static/benchmarks`
+and `--video` at `bunny`:
+
+```bash
+python3 src/scripts/train_nika.py \
+  --dataset-root static/benchmarks \
+  --video bunny \
+  --config xxs \
+  --device cuda:0
+```
+
+For the Bunny table in the draft, the relevant scales are:
+
+- `xxs`
+- `xs`
+- `small`
+
+To run the full Bunny scale sweep:
+
+```bash
+bash src/scripts/reproduce_bunny_scales.sh
+```
+
+### Evaluate Bunny
+
+```bash
+python3 src/scripts/evaluate_checkpoint.py \
+  models/xxs-bunny-epoch1998-psnr31.06.torch \
+  --dataset-root static/benchmarks \
+  --video bunny
+```
 
 ## Scope
 

@@ -1,3 +1,5 @@
+"""Utility workflows for selecting checkpoints, benchmarking, and visualization."""
+
 import os
 import time
 import torch
@@ -14,12 +16,32 @@ from configs import REFERENCES
 import subprocess
 
 def get_best_model(model_dir, vid_shape, vid_name, config, device):
+    """Load the highest-PSNR checkpoint that matches a video/config pair.
+
+    Args:
+        model_dir: Directory containing trained checkpoint files.
+        vid_shape: Video tensor shape used to size the model.
+        vid_name: Video identifier embedded in checkpoint filenames.
+        config: Configuration name embedded in checkpoint filenames.
+        device: Device on which to instantiate the model.
+
+    Returns:
+        A ``NikaBlock`` loaded from the best-scoring matching checkpoint.
+    """
     all_models = glob.glob(f"{model_dir}/{config}-{vid_name}-*.torch")
     if not all_models:
         raise ValueError(f"No models found for {vid_name} with config {config}")
 
     # Sort models by PSNR (extracting the PSNR value from the filename)
     def extract_psnr(filename):
+        """Parse the PSNR suffix from a checkpoint filename.
+
+        Args:
+            filename: Checkpoint filename containing a ``psnr`` token.
+
+        Returns:
+            The PSNR value encoded in the filename as a float.
+        """
         match = re.search(r'psnr([0-9]+(?:\.[0-9]+)?)', filename)
         if match:
             return float(match.group(1))
@@ -42,6 +64,14 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
 
 
 def benchmark_psnr(basedir, vid_name, config, device):
+    """Benchmark one trained checkpoint on a video sequence and save diagnostics.
+
+    Args:
+        basedir: Root directory containing the benchmark frame folders.
+        vid_name: Name of the video sequence to evaluate.
+        config: Model preset to load from ``models/ref_models``.
+        device: Device on which to run inference.
+    """
     vid = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     model = get_best_model(f"models/ref_models/", vid.shape, vid_name, config, device)
 
@@ -117,6 +147,14 @@ def benchmark_psnr(basedir, vid_name, config, device):
 
 
 def make_mp4(png_frame_dir, output_path="output.mp4", base_name="pred_frame", fps=24):
+    """Assemble numbered PNG frames into an MP4 using ffmpeg.
+
+    Args:
+        png_frame_dir: Directory containing sequentially numbered frame images.
+        output_path: Destination MP4 file path.
+        base_name: Filename prefix used before the numeric frame index.
+        fps: Output frame rate for the encoded video.
+    """
     # Assumes frames are named in order: frame000.png, frame001.png, ...
     input_pattern = os.path.join(png_frame_dir, f"{base_name}%03d.png")
     cmd = [
@@ -132,6 +170,17 @@ def make_mp4(png_frame_dir, output_path="output.mp4", base_name="pred_frame", fp
 
 
 def module_visualization(basedir, vid_name, n_frames, config, device, variants=None, batch_size=6):
+    """Render module-ablation visualizations for a trained checkpoint.
+
+    Args:
+        basedir: Root directory containing benchmark frame folders.
+        vid_name: Video identifier to visualize.
+        n_frames: Number of frames to render for the visualization run.
+        config: Model preset whose checkpoint should be loaded.
+        device: Device on which to run inference.
+        variants: Optional list of visualization variants to export.
+        batch_size: Number of frames to render per inference batch.
+    """
     if variants is None:
         variants = ['baseline', 'only_real_grid', 'only_realt', 'only_complex_grid', 'only_complext', 'temporal_operators']
 

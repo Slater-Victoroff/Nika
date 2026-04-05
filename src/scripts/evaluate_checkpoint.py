@@ -28,6 +28,11 @@ from nika import NikaBlock
 
 
 def parse_args() -> argparse.Namespace:
+    """Build and parse the CLI arguments for checkpoint evaluation.
+
+    Returns:
+        The parsed command-line namespace.
+    """
     parser = argparse.ArgumentParser(description="Evaluate one NIKA checkpoint")
     parser.add_argument("checkpoint")
     parser.add_argument("--dataset-root", default="static/benchmarks/uvg")
@@ -40,6 +45,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def parse_checkpoint_name(checkpoint: Path) -> tuple[str, str]:
+    """Infer the config and video name from a checkpoint filename.
+
+    Args:
+        checkpoint: Checkpoint path whose basename follows the training naming scheme.
+
+    Returns:
+        A ``(config_name, video_name)`` tuple extracted from the filename.
+    """
     match = re.match(r"^(.+)-(\w+)-epoch\d+-psnr[\d.]+\.torch$", checkpoint.name)
     if not match:
         raise ValueError(f"Could not parse checkpoint name: {checkpoint.name}")
@@ -47,6 +60,17 @@ def parse_checkpoint_name(checkpoint: Path) -> tuple[str, str]:
 
 
 def load_model(checkpoint: Path, video_shape: tuple[int, int, int, int], config: str, device: str) -> NikaBlock:
+    """Instantiate and restore the model needed to evaluate one checkpoint.
+
+    Args:
+        checkpoint: Checkpoint file to restore.
+        video_shape: Source video shape used to size the model.
+        config: Model preset name to instantiate.
+        device: Device on which to load the model.
+
+    Returns:
+        An evaluation-mode ``NikaBlock`` loaded with checkpoint weights.
+    """
     if config not in REFERENCES:
         raise ValueError(f"Unknown config: {config}")
     t, c, h, w = video_shape
@@ -64,6 +88,11 @@ def load_model(checkpoint: Path, video_shape: tuple[int, int, int, int], config:
 
 
 def main() -> int:
+    """Run the checkpoint evaluation workflow and emit metrics as JSON.
+
+    Returns:
+        Process exit status code.
+    """
     args = parse_args()
     checkpoint = Path(args.checkpoint)
     if not checkpoint.is_file():

@@ -1,3 +1,5 @@
+"""Core Nika model definitions, training entrypoints, and visualization helpers."""
+
 import os
 import time
 import math
@@ -24,10 +26,14 @@ from configs import REFERENCES
 class TuckerFactor(nn.Module):
     def __init__(self, target_dim, rank, is_complex=False, base_mag=1e-2, device='cuda'):
         """
-        Have to split into chunks because there's some weird bug in PyTorch
-        where if the dim is over like 520 or something everything just breaks.
+        Initialize a factor matrix, chunking large dimensions for PyTorch stability.
 
-        Perhaps someone can figure that out later, but the workaround seems easier atm.
+        Args:
+            target_dim: Output dimension of the factor matrix.
+            rank: Tucker rank represented by the factor.
+            is_complex: Whether to represent the factor with real and imaginary parts.
+            base_mag: Standard deviation scale used for random initialization.
+            device: Device on which to allocate the factor parameters.
         """
         super().__init__()
         self.max_chunk_size = 500
@@ -37,6 +43,14 @@ class TuckerFactor(nn.Module):
         self.device = device
 
         def make_chunk(chunk_size):
+            """Create one learnable factor chunk for the requested dimension size.
+
+            Args:
+                chunk_size: Number of rows to allocate in the chunk.
+
+            Returns:
+                Either one parameter tensor or a real/imaginary parameter pair.
+            """
             if self.is_complex:
                 return nn.Parameter(torch.randn(chunk_size, rank, device=device) * base_mag), \
                           nn.Parameter(torch.zeros(chunk_size, rank, device=device))  # real, imag
@@ -73,6 +87,11 @@ class TuckerFactor(nn.Module):
                 self.U = nn.Parameter(torch.randn(target_dim, rank, device=device) * base_mag)
 
     def forward(self):
+        """Materialize the full factor matrix from chunked or dense parameters.
+
+        Returns:
+            The assembled real or complex factor matrix.
+        """
         if self.chunked:
             if self.is_complex:
                 real_parts = []
@@ -96,6 +115,14 @@ class TuckerFactor(nn.Module):
         return U
 
     def get(self, target):
+        """Sample the temporal factor at normalized target coordinates.
+
+        Args:
+            target: Scalar or tensor of frame coordinates in ``[0, 1]``.
+
+        Returns:
+            Interpolated factor rows for the requested target coordinates.
+        """
         U = self.forward()
         target = torch.as_tensor(target, device=U.device, dtype=torch.float32)
 
@@ -107,6 +134,14 @@ class TuckerFactor(nn.Module):
         # x coord (W=1) stays 0
 
         def _sample(inp):
+            """Sample one real-valued factor matrix with ``grid_sample``.
+
+            Args:
+                inp: Factor matrix whose rows correspond to temporal positions.
+
+            Returns:
+                Interpolated factor rows for the requested target coordinates.
+            """
             inp_ = inp.transpose(0, 1).unsqueeze(0).unsqueeze(-1)  # [1, R, T, 1]
             out = F.grid_sample(inp_, grid, mode="bilinear", align_corners=True, padding_mode="border")
             return out.squeeze(0).squeeze(-1).transpose(0, 1)  # [B, R]
@@ -118,6 +153,13 @@ class TuckerFactor(nn.Module):
 
 class RealTucker(nn.Module):
     def __init__(self, target_shape, ranks, device='cuda'):
+        """Initialize the real-domain Tucker reconstruction branch.
+
+        Args:
+            target_shape: Full ``[C, H, W, T]`` shape of the target video tensor.
+            ranks: Tucker ranks for channel, height, width, and time factors.
+            device: Device on which to allocate the factor parameters.
+        """
         super().__init__()
         self.C, self.H, self.W, self.T = target_shape
         self.rC, self.rH, self.rW, self.rT = ranks
@@ -130,6 +172,14 @@ class RealTucker(nn.Module):
         self.G = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
 
     def forward(self, t):
+        """Reconstruct real-domain frames for the requested time coordinates.
+
+        Args:
+            t: Scalar or tensor of frame coordinates to reconstruct.
+
+        Returns:
+            Reconstructed frames from the real-domain Tucker decomposition.
+        """
         UT = self.UT.get(t)
         UC = self.UC()
         UH = self.UH()
@@ -140,6 +190,13 @@ class RealTucker(nn.Module):
 class ComplexTucker(RealTucker):
 
     def __init__(self, target_shape, ranks, device='cuda'):
+        """Initialize the FFT-domain Tucker reconstruction branch.
+
+        Args:
+            target_shape: Full ``[C, H, W, T]`` shape of the target video tensor.
+            ranks: Tucker ranks for channel, height, width, and time factors.
+            device: Device on which to allocate the factor parameters.
+        """
         super().__init__(target_shape, ranks, device=device)
         self.half_W = (self.W // 2) + 1
         self.UH = TuckerFactor(self.H, self.rH, is_complex=True, device=device)
@@ -154,6 +211,16 @@ class ComplexTucker(RealTucker):
         self.feature_grid = FeatureGrid([self.C * 2, self.H, self.half_W, self.T], grid_res=[self.C * 2, self.H, self.half_W, 1], device=device)
 
     def forward(self, t, zero_complex_tucker=False, zero_complex_grid=False):
+        """Reconstruct frames from complex Tucker factors and the complex feature grid.
+
+        Args:
+            t: Scalar or tensor of frame coordinates to reconstruct.
+            zero_complex_tucker: Whether to disable the complex Tucker branch.
+            zero_complex_grid: Whether to disable the complex feature-grid modulation.
+
+        Returns:
+            Real-valued frames reconstructed from the complex-domain representation.
+        """
         construct = torch.zeros((t.shape[0], self.C, self.H, self.half_W), device=t.device, dtype=torch.complex64)
         if not zero_complex_tucker:
             UH = self.UH()
@@ -175,6 +242,16 @@ class ComplexTucker(RealTucker):
 
 
 def grid_sample_base(H, W, device):
+    """Build a normalized spatial sampling grid for ``grid_sample`` operations.
+
+    Args:
+        H: Output grid height.
+        W: Output grid width.
+        device: Device on which to allocate the grid tensor.
+
+    Returns:
+        A tensor shaped ``(H, W, 2)`` containing normalized ``(x, y)`` coordinates.
+    """
     y_lin = torch.arange(0, H, device=device)
     x_lin = torch.arange(0, W, device=device)
     y_norm = 2.0 * (y_lin / (H - 1)) - 1.0
@@ -185,6 +262,14 @@ def grid_sample_base(H, W, device):
 
 class FeatureGrid(nn.Module):
     def __init__(self, target_shape, grid_res, zero_init=False, device="cuda"):
+        """Initialize the learned 4D feature grid used as a spatial prior.
+
+        Args:
+            target_shape: Full ``[C, H, W, T]`` shape of the target video tensor.
+            grid_res: Learnable grid resolution ``[C, H, W, T]`` used for sampling.
+            zero_init: Unused flag retained for compatibility with older experiments.
+            device: Device on which to allocate the grid parameters.
+        """
         super().__init__()
         self.C, self.H, self.W, self.T = target_shape
         self.grid_c = grid_res[0]
@@ -206,9 +291,22 @@ class FeatureGrid(nn.Module):
         self._grid_5d_view = None
     
     def _5d_grid(self):
+        """Reorder the stored grid into the 5D layout expected by ``grid_sample``.
+
+        Returns:
+            The learnable grid tensor shaped for volumetric sampling.
+        """
         return self.grid.permute(0, 3, 1, 2).unsqueeze(0)
 
     def forward(self, t):
+        """Sample the feature grid at the requested temporal coordinates.
+
+        Args:
+            t: Scalar or tensor of normalized frame coordinates in ``[0, 1]``.
+
+        Returns:
+            Sampled feature maps shaped like ``(B, C, H, W)``.
+        """
         device = self.grid.device
         B = t.shape[0]
 
@@ -235,6 +333,18 @@ class FeatureGrid(nn.Module):
 
 
 def tucker_construct(UT, UC, UH, UW, G):
+    """Assemble a Tucker reconstruction from factor matrices and a core tensor.
+
+    Args:
+        UT: Temporal factor values for the requested batch.
+        UC: Channel factor matrix.
+        UH: Height factor matrix.
+        UW: Width factor matrix.
+        G: Tucker core tensor.
+
+    Returns:
+        Reconstructed tensor shaped ``(T, C, H, W)`` for the requested times.
+    """
     UT = UT.contiguous()
     UC = UC.contiguous()
     UH = UH.contiguous()
@@ -242,6 +352,15 @@ def tucker_construct(UT, UC, UH, UW, G):
     G = G.contiguous()
 
     def _col_norm(M, eps=1e-8):
+        """Normalize factor columns to stabilize the Tucker contraction.
+
+        Args:
+            M: Real or complex factor matrix.
+            eps: Numerical floor added to column norms.
+
+        Returns:
+            The column-normalized factor matrix.
+        """
         if torch.is_complex(M):
             norms_sq = (M.real**2 + M.imag**2).sum(dim=0, keepdim=True)
             norms = torch.sqrt(norms_sq + eps)
@@ -260,6 +379,16 @@ def tucker_construct(UT, UC, UH, UW, G):
 
 class BasicUpres(nn.Module):
     def __init__(self, in_channels, out_channels, hidden, k, encoding_len=64, device='cuda'):
+        """Initialize the lightweight refinement and upsampling CNN.
+
+        Args:
+            in_channels: Number of channels in the low-resolution input tensor.
+            out_channels: Number of channels to emit after upsampling.
+            hidden: Hidden channel width used inside the CNN.
+            k: Pixel-shuffle upscale factor.
+            encoding_len: Unused compatibility parameter retained in the signature.
+            device: Device on which to allocate the module.
+        """
         super().__init__()
         half_k = k // 2
         self.k = k
@@ -283,12 +412,29 @@ class BasicUpres(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
+        """Upsample and refine a low-resolution feature tensor.
+
+        Args:
+            x: Low-resolution feature tensor to upsample.
+
+        Returns:
+            The refined high-resolution output tensor.
+        """
         base = self.upres(x)
         return base
 
 
 class ConvOperator(nn.Module):
     def __init__(self, in_channels, out_channels, h_dim, encoding_len=128, device='cuda'):
+        """Initialize a temporally modulated convolutional operator.
+
+        Args:
+            in_channels: Number of channels in the operator input tensor.
+            out_channels: Number of channels to emit.
+            h_dim: Hidden width used inside the operator network.
+            encoding_len: Width of the temporal Fourier embedding.
+            device: Device on which to allocate the module.
+        """
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -327,6 +473,15 @@ class ConvOperator(nn.Module):
         nn.init.zeros_(self.t_modulator[-1].bias)
 
     def forward(self, x, t):
+        """Apply the operator to neighboring-frame features at time ``t``.
+
+        Args:
+            x: Concatenated feature tensor containing source and target context.
+            t: Normalized time coordinates used to modulate the operator.
+
+        Returns:
+            Operator residuals aligned with the current frame representation.
+        """
         if x.all() == 0:
             return torch.zeros(
                 (x.shape[0], self.out_channels, x.shape[2], x.shape[3]),
@@ -346,6 +501,18 @@ class ConvOperator(nn.Module):
 
 class NikaBlock(nn.Module):
     def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, conv_hidden, out_channels, device):
+        """Initialize the full Nika model block used for training and inference.
+
+        Args:
+            target_shape: Full ``[C, H, W, T]`` shape of the target video tensor.
+            k: Spatial downsampling and pixel-shuffle upsampling factor.
+            real_tucker_ranks: Tucker ranks for the real-domain branch.
+            complex_tucker_ranks: Tucker ranks for the FFT-domain branch.
+            grid_ranks: Feature-grid resolution for the learned grid branch.
+            conv_hidden: Hidden width for the final upsampling CNN.
+            out_channels: Number of image channels to predict.
+            device: Device on which to allocate the module.
+        """
         super().__init__()
         self.C, self.H, self.W, self.T = target_shape
         self.H = int(self.H // k); self.W = int(self.W // k)
@@ -409,6 +576,7 @@ class NikaBlock(nn.Module):
         self.log_stats()
 
     def log_stats(self):
+        """Print a parameter-count breakdown for the compiled Nika model."""
         real_tucker_params = sum(p.numel() for p in self.real_tucker.parameters())
         complex_tucker_params = sum(p.numel() for p in self.complex_tucker.parameters())
         grid_params = sum(p.numel() for p in self.grid_features.parameters())
@@ -425,6 +593,20 @@ class NikaBlock(nn.Module):
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
     def forward(self, norm_t, noise_op=None, zero_real_tucker=False, zero_complex_tucker=False, zero_feature_grid=False, zero_complex_grid=False, return_operators=False):
+        """Predict frames at normalized time coordinates with optional ablations.
+
+        Args:
+            norm_t: Scalar or tensor of normalized frame coordinates in ``[0, 1]``.
+            noise_op: Unused compatibility argument retained in the signature.
+            zero_real_tucker: Whether to disable the real-domain Tucker branch.
+            zero_complex_tucker: Whether to disable the FFT-domain Tucker branch.
+            zero_feature_grid: Whether to disable the real feature-grid branch.
+            zero_complex_grid: Whether to disable complex feature-grid modulation.
+            return_operators: Whether to also return upsampled operator residuals.
+
+        Returns:
+            Either the reconstructed frames alone or the frames plus operator terms.
+        """
         if type(norm_t) is not torch.Tensor:
             norm_t = torch.tensor([norm_t], device=self.grid_features.grid.device, dtype=torch.float32)
 
@@ -507,6 +689,11 @@ class NikaBlock(nn.Module):
         return refined
 
     def test_images(self, output_dir):
+        """Render a few sample frames and write them to disk for spot checks.
+
+        Args:
+            output_dir: Directory where preview frames should be written.
+        """
         # self.eval()
         with torch.no_grad():
             if not os.path.exists(output_dir):
@@ -525,6 +712,14 @@ class NikaBlock(nn.Module):
 
 
 def feature_test(vid, name, config, device):
+    """Train the main Nika model on one video sequence.
+
+    Args:
+        vid: Video tensor shaped ``(T, C, H, W)`` containing training frames.
+        name: Name of the sequence, used for checkpoint naming.
+        config: Key into ``REFERENCES`` selecting the model hyperparameters.
+        device: Device on which to run training.
+    """
     batch_size = 6
     model_kwargs = REFERENCES[config]
     model = NikaBlock(
@@ -544,6 +739,16 @@ def feature_test(vid, name, config, device):
     # over the course of training (prevents large unrecoverable spikes).
     class TaperedWarmRestarts:
         def __init__(self, optimizer, T_0=200, T_mult=2, eta_min=0.0, max_epochs=2000, final_multiplier=0.2):
+            """Initialize a warm-restart scheduler whose amplitude tapers over time.
+
+            Args:
+                optimizer: Optimizer whose learning rate should be scheduled.
+                T_0: Initial restart period in epochs.
+                T_mult: Multiplicative factor applied to later restart periods.
+                eta_min: Minimum cosine-annealed learning rate.
+                max_epochs: Epoch budget used to compute the taper multiplier.
+                final_multiplier: Final scaling factor applied at the end of training.
+            """
             self.optimizer = optimizer
             self.base_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min
@@ -555,6 +760,11 @@ def feature_test(vid, name, config, device):
             self.last_epoch = -1
 
         def step(self, epoch=None):
+            """Advance the scheduler and apply the taper-adjusted restart scale.
+
+            Args:
+                epoch: Optional explicit epoch index to step to.
+            """
             # advance epoch counter
             if epoch is None:
                 self.last_epoch += 1

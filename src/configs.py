@@ -1,3 +1,5 @@
+"""Reference hyperparameter presets used to instantiate Nika model variants."""
+
 REFERENCES = {
     "xxs": {
         "grid_ranks": [1, 270, 480, 1],
