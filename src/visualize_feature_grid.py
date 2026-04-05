@@ -10,31 +10,13 @@ spatial-temporal features. This script creates visualizations showing:
 
 import argparse
 import os
-import re
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torchvision.utils import save_image, make_grid
 
-from configs import REFERENCES
-from nika import NikaBlock
-
-
-def parse_model_filename(path: str) -> tuple[str, str]:
-    """Extract the config and video identifiers encoded in a checkpoint filename.
-
-    Args:
-        path: Path to a checkpoint whose name follows the training naming convention.
-
-    Returns:
-        A ``(config_name, video_name)`` tuple parsed from the filename.
-    """
-    basename = os.path.basename(path)
-    match = re.match(r"^(.+)-(\w+)-epoch\d+-psnr[\d.]+\.torch$", basename)
-    if not match:
-        raise ValueError(f"Could not parse model filename: {basename}")
-    return match.group(1), match.group(2)
+from model_loading import parse_model_filename
 
 
 def load_feature_grid(path: str, device: str) -> torch.Tensor:

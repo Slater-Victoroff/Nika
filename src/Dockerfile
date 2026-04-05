@@ -22,6 +22,7 @@ RUN pip install numpy \
                 torch \
                 torchvision \
                 pillow \
+                matplotlib \
                 scikit-image \
                 piq \
                 pandas \
