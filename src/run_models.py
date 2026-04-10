@@ -4,6 +4,10 @@ import torch
 import torch.nn.functional as F
 from torchvision.utils import save_image
 from torch.autograd import grad
+try:
+    from torch.utils.flop_counter import FlopCounterMode
+except Exception:
+    FlopCounterMode = None
 
 import re
 import glob
@@ -127,7 +131,7 @@ def benchmark_psnr(basedir, vid_name, config, device):
     print(f"Timing run took {end_time - start_time:.4f} seconds")
 
 
-def benchmark_fps_torch_events(
+def benchmark_encoding_decoding_and_macs(
     basedir,
     vid_name,
     config,
@@ -136,78 +140,129 @@ def benchmark_fps_torch_events(
     batch_size=1,
     warmup_iters=10,
     repeats=50,
-    profile=True,
-    profile_dir="profiles",
-    profile_name="fps_benchmark",
 ):
     if "cuda" not in device:
         raise ValueError("This benchmark uses CUDA events; please use a CUDA device.")
 
-    # Determine model input shape using a single-frame probe (avoids loading full video)
-    probe = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=1, dtype=torch.uint8, normalize=False)
-    probe_shape = probe.shape  # (T_probe, C, H, W)
-    vid_shape = [n_frames, probe_shape[1], probe_shape[2], probe_shape[3]]
+    vid = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=n_frames, dtype=torch.uint8, normalize=False)
+    model = get_best_model(f"models/ref_models/", vid.shape, vid_name, config, device)
 
-    model = get_best_model(f"models/ref_models/", vid_shape, vid_name, config, device)
+    num_frames = int(vid.shape[0])
+    if batch_size != 1:
+        raise ValueError("This benchmark runs one frame at a time; set batch_size=1.")
+
+    norm_t_all = torch.linspace(0.0, 1.0, steps=num_frames, device=device, dtype=torch.float32)
+
+    # MACs (forward only). Note: FlopCounterMode reports FLOPs; MACs are approx FLOPs/2.
+    if FlopCounterMode is None:
+        macs_str = "MACs unavailable"
+    else:
+        model.eval()
+        sample_idx = torch.randint(0, num_frames, (batch_size,), device=device)
+        sample_norm_t = (sample_idx.float() / (num_frames - 1)).requires_grad_(True)
+        with torch.enable_grad(), FlopCounterMode(display=False) as fcm:
+            _ = model(sample_norm_t)
+        try:
+            total_flops = fcm.get_total_flops()
+        except Exception:
+            total_flops = None
+        if total_flops is None:
+            macs_str = "MACs unavailable"
+        else:
+            macs_str = f"{(total_flops / 2.0):.3e}"
+
+    # PSNR (full series, one frame at a time)
     model.eval()
+    total_psnr = 0.0
+    with torch.no_grad():
+        for i in range(num_frames):
+            batch_gt = vid[i:i + 1].to(torch.float32) / 255.0
+            pred = model(norm_t_all[i:i + 1])
+            mse = F.mse_loss(pred, batch_gt)
+            psnr = -10.0 * torch.log10(mse + 1e-8)
+            total_psnr += psnr.item()
+    psnr_val = total_psnr / float(num_frames)
 
-    num_frames = int(n_frames)
-    num_batches = (num_frames + batch_size - 1) // batch_size
+    # Profile trace (decode forward only)
+    trace_dir = os.path.join("profiles", "encoding_decoding_benchmark")
+    os.makedirs(trace_dir, exist_ok=True)
+    model.eval()
+    with torch.no_grad(), torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir),
+    ) as prof:
+        for i in range(min(num_frames, 5)):
+            _ = model(norm_t_all[i:i + 1])
+            prof.step()
 
-    # Warmup (not timed)
+    # Decode speed (forward-only)
+    model.eval()
     with torch.no_grad():
         for _ in range(warmup_iters):
-            for batch_idx in range(num_batches):
-                min_t = batch_idx * batch_size
-                max_t = min((batch_idx + 1) * batch_size, num_frames)
-                t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.float32)
-                norm_t_batch = t_batch / (num_frames - 1)
-                _ = model(norm_t_batch)
-
-    if profile:
-        os.makedirs(profile_dir, exist_ok=True)
-        trace_dir = os.path.join(profile_dir, profile_name)
-        with torch.no_grad(), torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=False,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir),
-        ) as prof:
-            for batch_idx in range(num_batches):
-                min_t = batch_idx * batch_size
-                max_t = min((batch_idx + 1) * batch_size, num_frames)
-                t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.float32)
-                norm_t_batch = t_batch / (num_frames - 1)
-                _ = model(norm_t_batch)
-                prof.step()
+            for i in range(num_frames):
+                _ = model(norm_t_all[i:i + 1])
 
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
-
     total_ms = 0.0
     total_frames = 0
-
     with torch.no_grad():
         for _ in range(repeats):
             torch.cuda.synchronize(device)
             starter.record()
-            for batch_idx in range(num_batches):
-                min_t = batch_idx * batch_size
-                max_t = min((batch_idx + 1) * batch_size, num_frames)
-                t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.float32)
-                norm_t_batch = t_batch / (num_frames - 1)
-                _ = model(norm_t_batch)
+            for i in range(num_frames):
+                _ = model(norm_t_all[i:i + 1])
             ender.record()
             torch.cuda.synchronize(device)
             total_ms += starter.elapsed_time(ender)
             total_frames += num_frames
 
-    avg_ms = total_ms / repeats
-    fps = (total_frames / repeats) / (avg_ms / 1000.0)
-    print(f"Benchmark FPS (CUDA events): {fps:.2f} fps | avg time: {avg_ms:.2f} ms per {num_frames} frames")
-    if profile:
-        print(f"Profiler trace saved to: {trace_dir}")
+    decode_avg_ms = total_ms / repeats
+    decode_fps = (total_frames / repeats) / (decode_avg_ms / 1000.0)
+
+    # Encode speed (training iter: forward + PSNR loss + backward, no optimizer step)
+    model.train()
+    opt = SOAP(model.parameters(), lr=1e-2, weight_decay=0)
+
+    def _train_iter():
+        idx = torch.randint(0, num_frames, (1,), device=device)
+        batch_gt = vid[idx].to(torch.float32) / 255.0
+        prediction = model(norm_t_all[idx])
+        mse = F.mse_loss(prediction, batch_gt)
+        psnr = -10.0 * torch.log10(mse + 1e-8)
+        loss = (-psnr).mean()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+
+    with torch.enable_grad():
+        for _ in range(warmup_iters):
+            _train_iter()
+
+    total_ms = 0.0
+    with torch.enable_grad():
+        for _ in range(repeats):
+            torch.cuda.synchronize(device)
+            starter.record()
+            _train_iter()
+            ender.record()
+            torch.cuda.synchronize(device)
+            total_ms += starter.elapsed_time(ender)
+
+    encode_avg_ms = total_ms / repeats
+    encode_iters_per_sec = 1000.0 / encode_avg_ms
+
+    print(
+        " | ".join([
+            f"Encoding speed: {encode_iters_per_sec:.2f} iters/s ({encode_avg_ms:.2f} ms/iter)",
+            f"Decoding speed: {decode_fps:.2f} fps ({decode_avg_ms:.2f} ms/{num_frames} frames)",
+            f"MACs per forward: {macs_str}",
+            f"PSNR (batch): {psnr_val:.2f} dB",
+            f"Profile: {trace_dir}",
+        ])
+    )
 
 
 def make_mp4(png_frame_dir, output_path="output.mp4", base_name="pred_frame", fps=24):
@@ -319,12 +374,13 @@ def module_visualization(basedir, vid_name, n_frames, config, device, variants=N
 if __name__ == "__main__":
     device = "cuda:1"
     name = "bunny"
-    config = "small"
+    n_frames = 132
+    config = "xs"
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     # module_visualization("static/benchmarks/uvg", name, n_frames=300, config=config, device=device)
-    benchmark_fps_torch_events("static/benchmarks", name, config, device, n_frames=132, batch_size=1)
+    benchmark_encoding_decoding_and_macs("static/benchmarks", name, config, device, n_frames=n_frames, batch_size=1)
     # benchmark_psnr("static/benchmarks/uvg", name, config, device)
     # make_mp4(f"visuals/{name}/{config}/preds", output_path=f"visuals/{name}/{config}/preds/output.mp4", base_name="pred_frame", fps=24)
     # make_mp4(f"visuals/{name}/{config}/residual", output_path=f"visuals/{name}/{config}/residual/output.mp4", base_name="residual_frame", fps=24)
