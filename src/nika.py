@@ -5,7 +5,7 @@ import glob
 from functools import partial
 
 import torch
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import profile, ProfilerActivity
 import torch.nn as nn
 from torchvision.utils import save_image
 import torch.nn.functional as F
@@ -49,6 +49,7 @@ class SimpleTuckerFactor(nn.Module):
             return torch.complex(self.U_real[index], self.U_imag[index])
         return self.U[index]
     
+    @torch._dynamo.disable
     def get_range(self, targets=None, indices=None, pad_to=None, pad_mode='border'):
         if targets is not None and indices is not None:
             raise ValueError("Cannot specify both targets and indices")
@@ -240,9 +241,9 @@ def tucker_construct(UT, UC, UH, UW, G):
     def _col_norm(M, eps=1e-8):
         if torch.is_complex(M):
             norms_sq = (M.real**2 + M.imag**2).sum(dim=0, keepdim=True)
-            norms = torch.sqrt(norms_sq + eps)
         else:
-            norms = M.norm(dim=0, keepdim=True) + eps
+            norms_sq = (M * M).sum(dim=0, keepdim=True)
+        norms = torch.sqrt(norms_sq + eps)
         return M / norms
 
     UH = _col_norm(UH)
@@ -250,7 +251,11 @@ def tucker_construct(UT, UC, UH, UW, G):
     UC = _col_norm(UC)
     UT = _col_norm(UT)
 
-    X = torch.einsum('ijkl,ti,cj,hk,wl->tchw', G, UT, UC, UH, UW)
+    X = torch.tensordot(UC, G, dims=([1], [1]))  # [C, rT, rH, rW]
+    X = torch.tensordot(UT, X, dims=([1], [1]))  # [T, C, rH, rW]
+    X = torch.tensordot(UH, X, dims=([1], [2]))  # [H, T, C, rW]
+    X = torch.tensordot(UW, X, dims=([1], [3]))  # [W, H, T, C]
+    X = X.permute(2, 3, 1, 0).contiguous()  # [T, C, H, W]
     return X
 
 
@@ -346,14 +351,14 @@ class NikaBlock(nn.Module):
             ranks=real_tucker_ranks,
             device=device,
         )
-        # self.real_tucker = torch.compile(self.real_tucker)
+        self.real_tucker = torch.compile(self.real_tucker)
 
         self.grid_features = FeatureGrid(
             target_shape=self.internal_shape,
             grid_res=grid_ranks,
             device=device,
         )
-        # self.grid_features = torch.compile(self.grid_features)
+        self.grid_features = torch.compile(self.grid_features)
 
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
@@ -365,7 +370,7 @@ class NikaBlock(nn.Module):
         self.n_heads = 3
 
         self.groupnorm = nn.GroupNorm(num_groups=self.n_heads, num_channels=self.n_heads * self.C).to(device)
-        # self.groupnorm = torch.compile(self.groupnorm)
+        self.groupnorm = torch.compile(self.groupnorm)
 
         op_hdim = 64
         self.operator_steps = 2
@@ -377,25 +382,12 @@ class NikaBlock(nn.Module):
             persistent=False
         )
 
-        self.forward_operators = nn.ModuleList()
-        self.backward_operators = nn.ModuleList()
-        for _ in range(self.operator_steps):
-            fwd = ConvOperator(
-                in_channels = 2 * self.n_heads * self.C,
-                out_channels = self.n_heads * self.C,
-                h_dim = op_hdim,
-                device = device,
-            )
-            bwd = ConvOperator(
-                in_channels = 2 * self.n_heads * self.C,
-                out_channels = self.n_heads * self.C,
-                h_dim = op_hdim,
-                device = device,
-            )
-            self.forward_operators.append(fwd)
-            self.backward_operators.append(bwd)
-            # self.forward_operators.append(torch.compile(fwd))
-            # self.backward_operators.append(torch.compile(bwd))
+        self.flow_operator = ConvOperator(
+            in_channels = 5 * self.n_heads * self.C,
+            out_channels = self.n_heads * self.C,
+            h_dim = op_hdim,
+            device = device,
+        )
 
         self.upres = BasicUpres(
             in_channels = self.n_heads * self.C,
@@ -404,7 +396,7 @@ class NikaBlock(nn.Module):
             k = k,    
             device = device,
         )
-        # self.upres = torch.compile(self.upres)
+        self.upres = torch.compile(self.upres)
 
         self.log_stats()
 
@@ -413,14 +405,16 @@ class NikaBlock(nn.Module):
         complex_tucker_params = sum(p.numel() for p in self.complex_tucker.parameters())
         grid_params = sum(p.numel() for p in self.grid_features.parameters())
         upres_params = sum(p.numel() for p in self.upres.parameters())
-        operator_params = sum(p.numel() for p in self.forward_operators.parameters()) + sum(p.numel() for p in self.backward_operators.parameters())
+        operator_params = sum(p.numel() for p in self.flow_operator.parameters()) # + sum(p.numel() for p in self.forward_operators.parameters()) + sum(p.numel() for p in self.backward_operators.parameters())
+        # operator_params = sum(p.numel() for p in self.forward_operators.parameters()) + sum(p.numel() for p in self.backward_operators.parameters())
         total_params = real_tucker_params + complex_tucker_params + grid_params + upres_params + operator_params
         print(f"NikaBlock parameters:")
         print(f"  Real Tucker:     {real_tucker_params / 1e6:.3f}M")
         print(f"  Complex Tucker:  {complex_tucker_params / 1e6:.3f}M")
         print(f"  Feature Grid:    {grid_params / 1e6:.3f}M")
-        print(f"  Forward Operator:{sum(p.numel() for p in self.forward_operators.parameters()) / 1e6:.3f}M")
-        print(f"  Backward Operator:{sum(p.numel() for p in self.backward_operators.parameters()) / 1e6:.3f}M")
+        print(f"  Flow Operator:   {operator_params / 1e6:.3f}M")
+        # print(f"  Forward Operator:{sum(p.numel() for p in self.forward_operators.parameters()) / 1e6:.3f}M")
+        # print(f"  Backward Operator:{sum(p.numel() for p in self.backward_operators.parameters()) / 1e6:.3f}M")
         print(f"  Upsampling CNN:  {upres_params / 1e6:.3f}M")
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
@@ -435,55 +429,43 @@ class NikaBlock(nn.Module):
             real_tucker = self.real_tucker(targets=(min_t, max_t), pad_to=self.B)
         else:
             real_tucker = self._zero_base.expand(self.B, -1, -1, -1)
+
         if not zero_feature_grid:
             grid_features = self.grid_features(self.B)
         else:
             grid_features = self._zero_base.expand(self.B, -1, -1, -1)
+
         if not zero_complex_tucker or not zero_complex_grid:
             complex_tucker = self.complex_tucker(
                 zero_complex_tucker=zero_complex_tucker, zero_complex_grid=zero_complex_grid, targets=(min_t, max_t), pad_to=self.B
             )
         else:
             complex_tucker = self._zero_base.expand(self.B, -1, -1, -1)
+
         response = torch.cat([real_tucker, grid_features, complex_tucker], dim=1)
+
         response = self.groupnorm(response)
+
         aggregated = response[self.operator_steps]
 
-        if return_operators:
-            operator_steps = []
-
-        for i in range(self.operator_steps):
-            prev_t = torch.clamp(norm_t - (i + 1) * self.dT, 0.0, 1.0)
-            prev_idx = self.operator_steps - (i + 1)
-            prev_input = torch.cat(
-                [response[prev_idx:prev_idx + 1], response[self.operator_steps:self.operator_steps + 1]],
-                dim=1,
-            )
-            with record_function(f"operator_forward_{i}"):
-                forward_prediction = self.forward_operators[i](prev_input, prev_t)
-
-            next_t = torch.clamp(norm_t + (i + 1) * self.dT, 0.0, 1.0)
-            next_idx = self.operator_steps + (i + 1)
-            next_input = torch.cat(
-                [response[next_idx:next_idx + 1], response[self.operator_steps:self.operator_steps + 1]],
-                dim=1,
-            )
-            with record_function(f"operator_backward_{i}"):
-                backward_prediction = self.backward_operators[i](next_input, next_t)
-
-            if return_operators:
-                operator_steps.append(forward_prediction)
-                operator_steps.append(backward_prediction)
-            aggregated = aggregated + forward_prediction + backward_prediction
-
-        with record_function("upres"):
-            prediction = self.upres(aggregated)
+        B, Cc, H, W = response.shape
+        # combine the time (B) and channel (Cc) dims into a single channel dim -> [1, B*Cc, H, W]
+        op_input = response.reshape(1, B * Cc, H, W)
+        prediction = self.flow_operator(op_input, norm_t)
+        aggregated = aggregated.unsqueeze(0)
+        aggregated = aggregated + prediction
 
         if return_operators:
-            operator_residuals = []
-            for op in operator_steps:
-                operator_residuals.append(self.upres(op))
-            return prediction, *operator_residuals
+            raise NotImplementedError("Operator return not implemented in this version")
+        #     operator_steps = []
+
+        prediction = self.upres(aggregated)
+
+        # if return_operators:
+        #     operator_residuals = []
+        #     for op in operator_steps:
+        #         operator_residuals.append(self.upres(op))
+        #     return prediction, *operator_residuals
         return prediction
 
     def test_images(self, output_dir):
