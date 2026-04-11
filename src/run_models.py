@@ -16,6 +16,7 @@ from nika import NikaBlock
 from soap import SOAP
 from configs import REFERENCES
 import subprocess
+import copy
 
 def get_best_model(model_dir, vid_shape, vid_name, config, device):
     all_models = glob.glob(f"{model_dir}/{config}-{vid_name}-*.torch")
@@ -48,7 +49,10 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
         if any("_orig_mod" in k for k in state_dict.keys()):
             cleaned_state = {}
             for k, v in state_dict.items():
-                cleaned_key = k.replace("._orig_mod", "")
+                cleaned_key = k
+                if cleaned_key.startswith("_orig_mod."):
+                    cleaned_key = cleaned_key[len("_orig_mod."):]
+                cleaned_key = cleaned_key.replace("._orig_mod.", ".")
                 cleaned_state[cleaned_key] = v
             model.load_state_dict(cleaned_state)
         else:
@@ -147,6 +151,15 @@ def benchmark_encoding_decoding_and_macs(
     vid = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=n_frames, dtype=torch.uint8, normalize=False)
     model = get_best_model(f"models/ref_models/", vid.shape, vid_name, config, device)
 
+    # make two independent module instances so train/eval modes don't interfere
+    encoding_model = copy.deepcopy(model)
+    encoding_model.train()
+    encoding_model = torch.compile(encoding_model, mode="default")
+
+    eval_model = copy.deepcopy(model)
+    eval_model.eval()
+    eval_model = torch.compile(eval_model, mode="reduce-overhead")
+
     num_frames = int(vid.shape[0])
     if batch_size != 1:
         raise ValueError("This benchmark runs one frame at a time; set batch_size=1.")
@@ -157,11 +170,10 @@ def benchmark_encoding_decoding_and_macs(
     if FlopCounterMode is None:
         macs_str = "MACs unavailable"
     else:
-        model.eval()
         sample_idx = torch.randint(0, num_frames, (batch_size,), device=device)
         sample_norm_t = (sample_idx.float() / (num_frames - 1)).requires_grad_(True)
         with torch.enable_grad(), FlopCounterMode(display=False) as fcm:
-            _ = model(sample_norm_t)
+            _ = eval_model(sample_norm_t)
         try:
             total_flops = fcm.get_total_flops()
         except Exception:
@@ -172,12 +184,11 @@ def benchmark_encoding_decoding_and_macs(
             macs_str = f"{(total_flops / 2.0):.3e}"
 
     # PSNR (full series, one frame at a time)
-    model.eval()
     total_psnr = 0.0
     with torch.no_grad():
         for i in range(num_frames):
             batch_gt = vid[i:i + 1].to(torch.float32) / 255.0
-            pred = model(norm_t_all[i:i + 1])
+            pred = eval_model(norm_t_all[i:i + 1])
             mse = F.mse_loss(pred, batch_gt)
             psnr = -10.0 * torch.log10(mse + 1e-8)
             total_psnr += psnr.item()
@@ -186,7 +197,6 @@ def benchmark_encoding_decoding_and_macs(
     # Profile trace (decode forward only)
     trace_dir = os.path.join("profiles", "encoding_decoding_benchmark")
     os.makedirs(trace_dir, exist_ok=True)
-    model.eval()
     with torch.no_grad(), torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
         record_shapes=True,
@@ -195,15 +205,14 @@ def benchmark_encoding_decoding_and_macs(
         on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir),
     ) as prof:
         for i in range(min(num_frames, 5)):
-            _ = model(norm_t_all[i:i + 1])
+            _ = eval_model(norm_t_all[i:i + 1])
             prof.step()
 
     # Decode speed (forward-only)
-    model.eval()
     with torch.no_grad():
         for _ in range(warmup_iters):
             for i in range(num_frames):
-                _ = model(norm_t_all[i:i + 1])
+                _ = eval_model(norm_t_all[i:i + 1])
 
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
@@ -214,7 +223,7 @@ def benchmark_encoding_decoding_and_macs(
             torch.cuda.synchronize(device)
             starter.record()
             for i in range(num_frames):
-                _ = model(norm_t_all[i:i + 1])
+                _ = eval_model(norm_t_all[i:i + 1])
             ender.record()
             torch.cuda.synchronize(device)
             total_ms += starter.elapsed_time(ender)
@@ -224,14 +233,12 @@ def benchmark_encoding_decoding_and_macs(
     decode_fps = (total_frames / repeats) / (decode_avg_ms / 1000.0)
 
     # Encode speed (training iter: forward + PSNR loss + backward, no optimizer step)
-    model.train()
-    opt = SOAP(model.parameters(), lr=1e-2, weight_decay=0)
+    opt = SOAP(encoding_model.parameters(), lr=1e-2, weight_decay=0)
 
-    def _train_iter():
-        idx = torch.randint(0, num_frames, (1,), device=device)
+    def _train_iter(idx):
         batch_gt = vid[idx].to(torch.float32) / 255.0
-        prediction = model(norm_t_all[idx])
-        mse = F.mse_loss(prediction, batch_gt)
+        prediction = encoding_model(norm_t_all[idx])
+        mse = F.mse_loss(prediction.squeeze(0), batch_gt)
         psnr = -10.0 * torch.log10(mse + 1e-8)
         loss = (-psnr).mean()
         opt.zero_grad(set_to_none=True)
@@ -239,19 +246,23 @@ def benchmark_encoding_decoding_and_macs(
 
     with torch.enable_grad():
         for _ in range(warmup_iters):
-            _train_iter()
+            for i in range(num_frames):
+                _train_iter(i)
 
     total_ms = 0.0
+    total_iters = 0
     with torch.enable_grad():
         for _ in range(repeats):
             torch.cuda.synchronize(device)
             starter.record()
-            _train_iter()
+            for i in range(num_frames):
+                _train_iter(i)
             ender.record()
             torch.cuda.synchronize(device)
             total_ms += starter.elapsed_time(ender)
+            total_iters += num_frames
 
-    encode_avg_ms = total_ms / repeats
+    encode_avg_ms = total_ms / max(1, total_iters)
     encode_iters_per_sec = 1000.0 / encode_avg_ms
 
     print(
@@ -375,7 +386,7 @@ if __name__ == "__main__":
     device = "cuda:1"
     name = "bunny"
     n_frames = 132
-    config = "xs"
+    config = "small"
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
