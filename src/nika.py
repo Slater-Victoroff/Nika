@@ -66,6 +66,7 @@ class SimpleTuckerFactor(nn.Module):
         if len(indices) != 2:
             raise ValueError("indices/targets must be a (start, end) pair")
 
+        start_idx, end_idx = indices
         start_idx = max(0, min(int(start_idx), self.target_dim - 1))
         end_idx = max(0, min(int(end_idx), self.target_dim - 1))
 
@@ -329,7 +330,12 @@ class ConvOperator(nn.Module):
 
     def forward(self, x, t):
         initial = self.operator_head(x)
-        time_emb = self.encoding(torch.as_tensor(t, device=x.device, dtype=torch.float32))
+        t_tensor = torch.as_tensor(t, device=x.device, dtype=torch.float32)
+        if t_tensor.dim() == 0:
+            t_tensor = t_tensor.view(1, 1)
+        elif t_tensor.dim() == 1:
+            t_tensor = t_tensor.view(-1, 1)
+        time_emb = self.encoding(t_tensor)
         modulation = self.t_modulator(time_emb)
         gamma, beta = modulation.chunk(2, dim=-1)
         gamma = gamma.view(-1, self.operator_head[-1].out_channels, 1, 1)
@@ -351,14 +357,14 @@ class NikaBlock(nn.Module):
             ranks=real_tucker_ranks,
             device=device,
         )
-        self.real_tucker = torch.compile(self.real_tucker)
+        # self.real_tucker = torch.compile(self.real_tucker)
 
         self.grid_features = FeatureGrid(
             target_shape=self.internal_shape,
             grid_res=grid_ranks,
             device=device,
         )
-        self.grid_features = torch.compile(self.grid_features)
+        # self.grid_features = torch.compile(self.grid_features)
 
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
@@ -370,7 +376,7 @@ class NikaBlock(nn.Module):
         self.n_heads = 3
 
         self.groupnorm = nn.GroupNorm(num_groups=self.n_heads, num_channels=self.n_heads * self.C).to(device)
-        self.groupnorm = torch.compile(self.groupnorm)
+        # self.groupnorm = torch.compile(self.groupnorm)
 
         op_hdim = 64
         self.operator_steps = 2
@@ -396,7 +402,7 @@ class NikaBlock(nn.Module):
             k = k,    
             device = device,
         )
-        self.upres = torch.compile(self.upres)
+        # self.upres = torch.compile(self.upres)
 
         self.log_stats()
 
@@ -442,9 +448,9 @@ class NikaBlock(nn.Module):
         else:
             complex_tucker = self._zero_base.expand(self.B, -1, -1, -1)
 
-        response = torch.cat([real_tucker, grid_features, complex_tucker], dim=1)
-
-        response = self.groupnorm(response)
+        response = self.groupnorm(
+            torch.cat([real_tucker, grid_features, complex_tucker], dim=1)
+        )
 
         aggregated = response[self.operator_steps]
 
@@ -474,24 +480,37 @@ class NikaBlock(nn.Module):
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
             rand_vals = torch.linspace(0, 1, steps=10, dtype=torch.float32, device=self.grid_features.grid.device)
-            imgs = []
-            total_ms = 0.0
+
+            # Warmup once to get output shape (not measured)
+            target0 = torch.tensor([rand_vals[0]], device=self.grid_features.grid.device, dtype=torch.float32)
+            img0 = self.forward(target0)
+            # allocate GPU buffer to avoid appends / CPU transfers during timing
+            imgs_gpu = torch.empty((len(rand_vals),) + img0.shape, device=img0.device, dtype=img0.dtype)
+            imgs_gpu[0].copy_(img0.detach())
+
             starter = torch.cuda.Event(enable_timing=True)
             ender = torch.cuda.Event(enable_timing=True)
-            for rand_val in rand_vals:
-                target = torch.tensor([rand_val], device=self.grid_features.grid.device, dtype=torch.float32)
-                starter.record()
+
+            # timed region: only forward calls and storing into preallocated GPU buffer
+            starter.record()
+            for i, rv in enumerate(rand_vals):
+                if i == 0:
+                    continue  # already have warmup result stored
+                torch.compiler.cudagraph_mark_step_begin()
+                target = torch.tensor([rv], device=self.grid_features.grid.device, dtype=torch.float32)
                 img = self.forward(target)
-                ender.record()
-                torch.cuda.synchronize()
-                total_ms += starter.elapsed_time(ender)
-                imgs.append(img.detach().cpu())
+                imgs_gpu[i].copy_(img.detach())
+            ender.record()
+            torch.cuda.synchronize()
+            total_ms = starter.elapsed_time(ender)
             average_frame_time = (total_ms / rand_vals.shape[0]) / 1000.0
             print(f"Average inference time per frame: {average_frame_time:.5f}s")
             print(f"FPS: {1.0 / average_frame_time:.2f}")
-            for i in range(len(imgs)):
-                img = imgs[i].clamp(0.0, 1.0)
-                save_image(img, f"{output_dir}/frame_{i:04d}.png")
+
+            # Move to CPU and save (post-measurement)
+            imgs_cpu = imgs_gpu.clamp(0.0, 1.0).cpu()
+            for i in range(len(rand_vals)):
+                save_image(imgs_cpu[i], f"{output_dir}/frame_{i:04d}.png")
 
 
 def feature_test(vid, name, config, device):
@@ -504,6 +523,8 @@ def feature_test(vid, name, config, device):
         out_channels=3,
         device=device,
     )
+
+    model = torch.compile(model)
 
     base_lr = 1e-2
     # single optimizer for all parameters (everything moves together)
@@ -573,17 +594,18 @@ def feature_test(vid, name, config, device):
             batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
             t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
             norm_t_batch = t_batch.float() / (vid.shape[0] - 1)
+            torch.compiler.cudagraph_mark_step_begin()
             prediction = model(norm_t_batch)
             mse = F.mse_loss(prediction, batch_gt)
             psnr = -10.0 * torch.log10(mse + 1e-8)
             frame_loss = (-psnr).mean() / num_batches
             frame_loss.backward()
-            loss += frame_loss
+            loss += frame_loss.item()
         opt.step()
         scheduler.step()
         average_frame_time = (time.time() - start_time) / vid.shape[0]
-        epoch_psnr = -loss.item()
-        print(f"Epoch {epoch} loss: {loss.item():.4f}, time: {average_frame_time:.5f}s, PSNR: {epoch_psnr:.2f}")
+        epoch_psnr = -loss
+        print(f"Epoch {epoch} loss: {loss:.4f}, time: {average_frame_time:.5f}s, PSNR: {epoch_psnr:.2f}")
 
         if epoch_psnr > best_psnr and (epoch - best_epoch >= 10 or best_epoch == -1):
             best_psnr = epoch_psnr
@@ -602,9 +624,9 @@ def feature_test(vid, name, config, device):
 
 if __name__ == "__main__":
     device = "cuda:0"
-    name = "shake"
+    name = "bunny"
     torch.manual_seed(42)
-    vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=300, dtype=torch.uint8, normalize=False)
+    vid = load_video_frames(f"static/benchmarks/{name}", device, max_frames=132, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
