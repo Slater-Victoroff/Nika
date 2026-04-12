@@ -188,13 +188,13 @@ class RealTucker(nn.Module):
 
 
 class ComplexTucker(RealTucker):
-
-    def __init__(self, target_shape, ranks, device='cuda'):
+    def __init__(self, target_shape, ranks, grid_res, device='cuda'):
         """Initialize the FFT-domain Tucker reconstruction branch.
 
         Args:
             target_shape: Full ``[C, H, W, T]`` shape of the target video tensor.
             ranks: Tucker ranks for channel, height, width, and time factors.
+            grid_res: Feature grid resolution ``[C, H, W, T]`` used for sampling.
             device: Device on which to allocate the factor parameters.
         """
         super().__init__(target_shape, ranks, device=device)
@@ -208,7 +208,13 @@ class ComplexTucker(RealTucker):
         self.G_real = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
         self.G_imag = nn.Parameter(torch.zeros(self.rT, self.rC, self.rH, self.rW, device=device))
 
-        self.feature_grid = FeatureGrid([self.C * 2, self.H, self.half_W, self.T], grid_res=[self.C * 2, self.H, self.half_W, 1], device=device)
+        grid_c, grid_h, grid_w, grid_t = grid_res
+        half_grid_w = (grid_w // 2) + 1
+        print(f"target shape: C={self.C}, H={self.H}, W={self.W}, T={self.T}")
+        print(f"Initializing complex tucker with ranks: C={self.rC}, H={self.rH}, W={self.rW}, T={self.rT}")
+        print(f"Initializing feature grid with resolution: C={grid_c}, H={grid_h}, W={grid_w}, T={grid_t}")
+
+        self.feature_grid = FeatureGrid([self.C * 2, self.H, self.half_W, self.T], grid_res=[grid_c, grid_h, half_grid_w, grid_t], device=device)
 
     def forward(self, t, zero_complex_tucker=False, zero_complex_grid=False):
         """Reconstruct frames from complex Tucker factors and the complex feature grid.
@@ -266,7 +272,7 @@ class FeatureGrid(nn.Module):
 
         Args:
             target_shape: Full ``[C, H, W, T]`` shape of the target video tensor.
-            grid_res: Learnable grid resolution ``[C, H, W, T]`` used for sampling.
+            grid_res: Feature grid resolution ``[C, H, W, T]`` used for sampling.
             zero_init: Unused flag retained for compatibility with older experiments.
             device: Device on which to allocate the grid parameters.
         """
@@ -535,6 +541,7 @@ class NikaBlock(nn.Module):
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
             ranks=complex_tucker_ranks,
+            grid_res=grid_ranks,
             device=device,
         )
 
@@ -841,10 +848,10 @@ def feature_test(vid, name, config, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:0"
-    name = "honey"
+    device = "cuda:1"
+    name = "shake"
     torch.manual_seed(42)
-    vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=300, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
