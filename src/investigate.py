@@ -6,19 +6,6 @@ import math
 
 from nika import load_video_frames
 
-def _unfold(x: torch.Tensor, mode: int) -> torch.Tensor:
-    """Unfold a 4D tensor along one mode into a matrix.
-
-    Args:
-        x: Tensor shaped like ``(T, C, H, W)``.
-        mode: Axis to move to the matrix row dimension.
-
-    Returns:
-        A 2D matrix view of the tensor for singular-value analysis.
-    """
-    x = x.movedim(mode, 0)
-    return x.reshape(x.shape[0], -1)
-
 
 @torch.no_grad()
 def _top_svals(A: torch.Tensor, k: int, niter: int = 2) -> torch.Tensor:
@@ -77,39 +64,6 @@ def _top_svals_via_gram(A: torch.Tensor, k: int, chunk_cols: int = 65536) -> tor
     svals = svals.flip(0)
     q = min(k, svals.numel())
     return svals[:q]
-
-
-def _top_svecs_via_gram(A: torch.Tensor, k: int, chunk_cols: int = 65536):
-    """
-    Compute leading left singular vectors and values via a chunked Gram matrix.
-
-    Args:
-        A: Matrix shaped ``(d, M)`` to analyze.
-        k: Number of singular vectors and values to return.
-        chunk_cols: Number of columns to process per Gram-matrix chunk.
-
-    Returns:
-        A tuple ``(U, svals)`` containing left singular vectors and singular values.
-    """
-    d, M = A.shape
-    if M == 0 or k <= 0:
-        return torch.empty((d, 0), device=A.device, dtype=torch.float32), torch.empty((0,), device=A.device)
-
-    G = torch.zeros((d, d), device=A.device, dtype=torch.float64)
-    for s in range(0, M, chunk_cols):
-        e = min(s + chunk_cols, M)
-        chunk = A[:, s:e].to(torch.float32)
-        G += (chunk @ chunk.T).to(torch.float64)
-
-    vals, vecs = torch.linalg.eigh(G)
-    vals = vals.clamp_min(0.0)
-    # reverse order to descending
-    vals = vals.flip(0)
-    vecs = vecs.flip(1)
-    q = min(k, vals.numel())
-    svals = torch.sqrt(vals[:q]).to(torch.float32)
-    U = vecs[:, :q].to(torch.float32)
-    return U, svals
 
 
 def _top_svals_via_gram_from_tensor(x: torch.Tensor, mode: int, k: int, chunk_cols: int = 65536):
@@ -418,69 +372,6 @@ def tune_energy_for_center_grid4d(
             lo = mid
 
     return best
-
-
-def deflate_tensor(video_tensor: torch.Tensor, remove_ranks: tuple[int, int, int, int], chunk_cols: int = 65536, compute_device: str = 'cpu') -> torch.Tensor:
-    """
-    Remove leading singular components from each unfolding of a 4D video tensor.
-
-    Args:
-        video_tensor: Input tensor shaped ``(T, C, H, W)``.
-        remove_ranks: Number of leading singular directions to remove per mode.
-        chunk_cols: Approximate unfolding-column budget per accumulation step.
-        compute_device: Device on which to perform the deflation work.
-
-    Returns:
-        The residual tensor after per-mode deflation.
-    """
-    assert video_tensor.ndim == 4
-    T, C, H, W = video_tensor.shape
-    x = video_tensor.to(torch.float32)
-    if x.max() > 2.0:
-        x = x / 255.0
-    x = x - x.mean()
-
-    dev = torch.device(compute_device or 'cpu')
-    x = x.to(dev)
-
-    for mode in range(4):
-        r = int(remove_ranks[mode])
-        if r <= 0:
-            continue
-        A = _unfold(x, mode)  # (d, M)
-        U, _ = _top_svecs_via_gram(A, k=r, chunk_cols=chunk_cols)
-        if U.numel() == 0:
-            continue
-        # project: A_proj = U @ (U.T @ A)
-        coef = U.T @ A  # (r, M)
-        A_proj = U @ coef  # (d, M)
-        A = A - A_proj
-        x = _fold_from_unfold(A, (T, C, H, W), mode).to(dev)
-
-    return x
-
-
-def deflate_and_reestimate(video_tensor: torch.Tensor, remove_ranks: tuple[int, int, int, int], **rank_kwargs):
-    """
-    Deflate leading components from a video tensor and recompute its rank estimate.
-
-    Args:
-        video_tensor: Input tensor shaped ``(T, C, H, W)``.
-        remove_ranks: Number of leading singular directions to remove per mode.
-        **rank_kwargs: Keyword arguments forwarded to ``rank_estimate``.
-
-    Returns:
-        A tuple containing original ranks, residual ranks, and both singular spectra.
-    """
-    # compute original ranks/svals
-    orig_ranks, orig_svals = rank_estimate(video_tensor, **rank_kwargs)
-    # deflate
-    residual = deflate_tensor(video_tensor, remove_ranks, compute_device=rank_kwargs.get('compute_device', 'cpu'))
-    # recompute ranks on residual
-    res_ranks, res_svals = rank_estimate(residual, **rank_kwargs)
-    return orig_ranks, res_ranks, orig_svals, res_svals
-
-
 def _rank_for_energy(s: torch.Tensor, energy: float, rmin: int = 1, rmax: int | None = None) -> int:
     """Choose the smallest rank whose cumulative energy clears a target.
 

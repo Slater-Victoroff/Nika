@@ -9,14 +9,13 @@ Creates a side-by-side comparison video showing:
 
 import argparse
 import os
-import re
 
 import imageio
 import numpy as np
 import torch
 
-from configs import REFERENCES
 from load_data import load_video_frames
+from model_loading import load_model, parse_model_filename
 from nika import NikaBlock
 
 # Mapping from model video names to actual folder names
@@ -29,56 +28,6 @@ VIDEO_NAME_MAP = {
     "shake": ["shake", "ShakeNDry"],
     "yacht": ["yacht", "YachtRide"],
 }
-
-
-def parse_model_filename(path: str) -> tuple[str, str]:
-    """Extract the config and video identifiers encoded in a checkpoint filename.
-
-    Args:
-        path: Path to a checkpoint whose filename follows the training convention.
-
-    Returns:
-        A tuple containing the config name and video name.
-    """
-    basename = os.path.basename(path)
-    match = re.match(r"^(.+)-(\w+)-epoch\d+-psnr[\d.]+\.torch$", basename)
-    if not match:
-        raise ValueError(f"Could not parse model filename: {basename}")
-    return match.group(1), match.group(2)
-
-
-def load_model(path: str, vid_shape: tuple, config: str, device: str) -> NikaBlock:
-    """Instantiate and restore a ``NikaBlock`` checkpoint for video rendering.
-
-    Args:
-        path: Checkpoint file to load.
-        vid_shape: Shape of the source video tensor used to size the model.
-        config: Configuration preset name used to build the model.
-        device: Device on which the model should be instantiated.
-
-    Returns:
-        A restored evaluation-mode model ready for inference.
-    """
-    if config not in REFERENCES:
-        raise ValueError(f"Unknown config: {config}. Valid: {list(REFERENCES.keys())}")
-
-    T, C, H, W = vid_shape
-
-    model = NikaBlock(
-        target_shape=[4, H, W, T],
-        k=4,
-        **REFERENCES[config],
-        out_channels=3,
-        device=device,
-    )
-
-    state_dict = torch.load(path, map_location=device)
-    model.load_state_dict(state_dict)
-    model.eval()
-
-    return model
-
-
 def add_label_to_frame(frame: np.ndarray, labels: list[str]) -> np.ndarray:
     """Overlay text labels on the panels of a stitched comparison frame.
 

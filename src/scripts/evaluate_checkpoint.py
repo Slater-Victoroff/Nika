@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 import time
 from pathlib import Path
@@ -22,9 +21,8 @@ SRC_ROOT = Path(__file__).resolve().parents[1]
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from configs import REFERENCES
 from load_data import load_video_frames
-from nika import NikaBlock
+from model_loading import load_model, parse_model_filename
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,51 +40,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=6)
     parser.add_argument("--json", dest="json_path", default=None)
     return parser.parse_args()
-
-
-def parse_checkpoint_name(checkpoint: Path) -> tuple[str, str]:
-    """Infer the config and video name from a checkpoint filename.
-
-    Args:
-        checkpoint: Checkpoint path whose basename follows the training naming scheme.
-
-    Returns:
-        A ``(config_name, video_name)`` tuple extracted from the filename.
-    """
-    match = re.match(r"^(.+)-(\w+)-epoch\d+-psnr[\d.]+\.torch$", checkpoint.name)
-    if not match:
-        raise ValueError(f"Could not parse checkpoint name: {checkpoint.name}")
-    return match.group(1), match.group(2)
-
-
-def load_model(checkpoint: Path, video_shape: tuple[int, int, int, int], config: str, device: str) -> NikaBlock:
-    """Instantiate and restore the model needed to evaluate one checkpoint.
-
-    Args:
-        checkpoint: Checkpoint file to restore.
-        video_shape: Source video shape used to size the model.
-        config: Model preset name to instantiate.
-        device: Device on which to load the model.
-
-    Returns:
-        An evaluation-mode ``NikaBlock`` loaded with checkpoint weights.
-    """
-    if config not in REFERENCES:
-        raise ValueError(f"Unknown config: {config}")
-    t, c, h, w = video_shape
-    model = NikaBlock(
-        target_shape=[4, h, w, t],
-        k=4,
-        **REFERENCES[config],
-        out_channels=3,
-        device=device,
-    )
-    state_dict = torch.load(checkpoint, map_location=device)
-    model.load_state_dict(state_dict)
-    model.eval()
-    return model
-
-
 def main() -> int:
     """Run the checkpoint evaluation workflow and emit metrics as JSON.
 
@@ -98,7 +51,7 @@ def main() -> int:
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Missing checkpoint: {checkpoint}")
 
-    config, inferred_video = parse_checkpoint_name(checkpoint)
+    config, inferred_video = parse_model_filename(str(checkpoint))
     video_name = args.video or inferred_video
     video_dir = Path(args.dataset_root) / video_name
     if not video_dir.is_dir():
