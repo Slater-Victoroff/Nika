@@ -386,3 +386,31 @@ def forward_with_intermediates(
 
 def forward(params: dict[str, jnp.ndarray], norm_t: jnp.ndarray, spec: CurrentNikaSpec) -> jnp.ndarray:
     return forward_with_intermediates(params, norm_t, spec)["output"]
+
+
+def batch_forward(
+    params: dict[str, jnp.ndarray],
+    norm_t_batch: jnp.ndarray,
+    spec: CurrentNikaSpec,
+) -> jnp.ndarray:
+    runtime = _ensure_prepared(params, spec)
+    norm_t_batch = jnp.asarray(norm_t_batch, dtype=jnp.float32).reshape(-1)
+    return jax.vmap(lambda nt: forward(runtime, jnp.asarray([nt], dtype=jnp.float32), spec)[0])(norm_t_batch)
+
+
+def batch_psnr_loss(
+    params: dict[str, jnp.ndarray],
+    norm_t_batch: jnp.ndarray,
+    targets: jnp.ndarray,
+    spec: CurrentNikaSpec,
+) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+    predictions = batch_forward(params, norm_t_batch, spec)
+    targets = jnp.asarray(targets, dtype=jnp.float32)
+    mse = jnp.mean((predictions - targets) ** 2, axis=(1, 2, 3))
+    psnr = -10.0 * jnp.log10(mse + 1e-8)
+    loss = jnp.mean(-psnr)
+    return loss, {
+        "predictions": predictions,
+        "mse": mse,
+        "psnr": psnr,
+    }
