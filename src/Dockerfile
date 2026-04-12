@@ -1,3 +1,4 @@
+# Container image used to run Nika training, evaluation, and dataset-preparation scripts.
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
 WORKDIR /app
@@ -24,6 +25,7 @@ RUN pip install numpy \
                 scikit-image \
                 piq \
                 pandas \
+                py7zr \
                 torch_dct \
                 tensorboard \
                 opencv-python \
