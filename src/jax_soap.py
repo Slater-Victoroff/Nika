@@ -72,17 +72,19 @@ def _canonicalize_subspace(basis: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarra
     if basis.size == 0:
         return basis
     dim, width = basis.shape
-    eye = jnp.eye(dim, dtype=basis.dtype)
+    eye = jnp.eye(width, dtype=basis.dtype)
     chosen: list[jnp.ndarray] = []
 
     def orthogonalize(vec: jnp.ndarray) -> jnp.ndarray:
-        for prev in chosen:
-            vec = vec - prev * jnp.vdot(prev, vec)
+        if not chosen:
+            return vec
+        for _ in range(2):
+            for prev in chosen:
+                vec = vec - prev * jnp.vdot(prev, vec)
         return vec
 
     for i in range(dim):
-        e = eye[:, i]
-        vec = basis @ (basis.T @ e)
+        vec = basis[i, :]
         vec = orthogonalize(vec)
         norm = jnp.linalg.norm(vec)
         if float(norm) > eps:
@@ -92,7 +94,7 @@ def _canonicalize_subspace(basis: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarra
 
     if len(chosen) < width:
         for i in range(width):
-            vec = orthogonalize(basis[:, i])
+            vec = orthogonalize(eye[:, i])
             norm = jnp.linalg.norm(vec)
             if float(norm) > eps:
                 chosen.append(vec / norm)
@@ -102,7 +104,10 @@ def _canonicalize_subspace(basis: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarra
     if len(chosen) != width:
         raise RuntimeError(f"Failed to canonicalize subspace of width {width}")
 
-    return _canonicalize_column_signs(jnp.stack(chosen, axis=1), eps=eps)
+    chosen_mat = jnp.stack(chosen, axis=1)
+    rot, _ = jnp.linalg.qr(chosen_mat, mode="reduced")
+    rot = rot[:, :width].astype(basis.dtype)
+    return _canonicalize_column_signs(basis @ rot, eps=eps)
 
 
 def _canonicalize_eigenbasis(eigvals: jnp.ndarray, eigvecs: jnp.ndarray, group_rtol: float = 1e-5, eps: float = 1e-12) -> jnp.ndarray:

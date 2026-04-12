@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +48,120 @@ def _parse_frame_indices(raw: str | None, n_frames: int, num_steps: int) -> list
     return [int(item) for item in indices.tolist()]
 
 
+def _parse_csv_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _param_slug(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).replace(".", "__")
+
+
+def _torch_collect_matrix_arrays(prefix: str, mats: list | tuple) -> tuple[dict[str, np.ndarray], list[int]]:
+    arrays: dict[str, np.ndarray] = {}
+    indices: list[int] = []
+    for idx, mat in enumerate(mats):
+        if isinstance(mat, list) and len(mat) == 0:
+            continue
+        arrays[f"{prefix}{idx}"] = mat.detach().cpu().numpy()
+        indices.append(idx)
+    return arrays, indices
+
+
+def _torch_debug_snapshot(optimizer: SOAP, param: torch.nn.Parameter, state: dict, group: dict) -> tuple[dict[str, np.ndarray], dict]:
+    arrays: dict[str, np.ndarray] = {
+        "param_before": param.detach().cpu().numpy(),
+        "grad": param.grad.detach().cpu().numpy(),
+    }
+    meta = {
+        "step_before": int(state.get("step", 0)),
+        "had_q": bool(state.get("Q") is not None),
+        "precondition_frequency": int(group["precondition_frequency"]),
+    }
+
+    gg_prev, gg_prev_indices = _torch_collect_matrix_arrays("gg_prev_", state.get("GG", []))
+    arrays.update(gg_prev)
+    meta["gg_prev_indices"] = gg_prev_indices
+
+    if state.get("Q") is None:
+        return arrays, meta
+
+    q_prev, q_prev_indices = _torch_collect_matrix_arrays("q_prev_", state["Q"])
+    arrays.update(q_prev)
+    meta["q_prev_indices"] = q_prev_indices
+
+    grad_projected = optimizer.project(
+        param.grad,
+        state,
+        merge_dims=group["merge_dims"],
+        max_precond_dim=group["max_precond_dim"],
+    )
+    beta1, beta2 = group["betas"]
+    step_num = int(state["step"]) + 1
+    exp_avg_prev = state["exp_avg"].detach().clone()
+    exp_avg_sq_prev = state["exp_avg_sq"].detach().clone()
+    exp_avg_next = exp_avg_prev * beta1 + grad_projected * (1.0 - beta1)
+    exp_avg_sq_next = exp_avg_sq_prev * beta2 + grad_projected.square() * (1.0 - beta2)
+    denom = exp_avg_sq_next.sqrt() + group["eps"]
+
+    step_size = float(group["lr"])
+    if group["correct_bias"]:
+        bias_correction1 = 1.0 - beta1 ** step_num
+        bias_correction2 = 1.0 - beta2 ** step_num
+        step_size = step_size * (bias_correction2 ** 0.5) / bias_correction1
+
+    norm_grad = optimizer.project_back(
+        exp_avg_next / denom,
+        state,
+        merge_dims=group["merge_dims"],
+        max_precond_dim=group["max_precond_dim"],
+    )
+    if group["normalize_grads"]:
+        norm_grad = norm_grad / (1e-30 + torch.mean(norm_grad ** 2) ** 0.5)
+
+    param_after_formula = param.detach().clone()
+    param_after_formula.add_(norm_grad, alpha=-step_size)
+    if group["weight_decay"] > 0.0:
+        param_after_formula.add_(param_after_formula, alpha=(-group["lr"] * group["weight_decay"]))
+
+    arrays.update({
+        "grad_projected": grad_projected.detach().cpu().numpy(),
+        "exp_avg_prev": exp_avg_prev.detach().cpu().numpy(),
+        "exp_avg_sq_prev": exp_avg_sq_prev.detach().cpu().numpy(),
+        "exp_avg_next": exp_avg_next.detach().cpu().numpy(),
+        "exp_avg_sq_next": exp_avg_sq_next.detach().cpu().numpy(),
+        "denom": denom.detach().cpu().numpy(),
+        "norm_grad": norm_grad.detach().cpu().numpy(),
+        "param_after_formula": param_after_formula.detach().cpu().numpy(),
+    })
+    meta["step_num"] = step_num
+    meta["step_size"] = step_size
+    return arrays, meta
+
+
+def _torch_post_state_snapshot(param: torch.nn.Parameter, state: dict) -> tuple[dict[str, np.ndarray], dict]:
+    arrays: dict[str, np.ndarray] = {
+        "param_after_actual": param.detach().cpu().numpy(),
+    }
+    meta = {
+        "step_after": int(state.get("step", 0)),
+        "had_q_after": bool(state.get("Q") is not None),
+    }
+    if "exp_avg" in state:
+        arrays["exp_avg_post"] = state["exp_avg"].detach().cpu().numpy()
+    if "exp_avg_sq" in state:
+        arrays["exp_avg_sq_post"] = state["exp_avg_sq"].detach().cpu().numpy()
+    gg_post, gg_post_indices = _torch_collect_matrix_arrays("gg_post_", state.get("GG", []))
+    arrays.update(gg_post)
+    meta["gg_post_indices"] = gg_post_indices
+    if state.get("Q") is not None:
+        q_post, q_post_indices = _torch_collect_matrix_arrays("q_post_", state["Q"])
+        arrays.update(q_post)
+        meta["q_post_indices"] = q_post_indices
+    return arrays, meta
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
@@ -68,6 +183,11 @@ def main() -> int:
     parser.add_argument("--normalize-grads", action="store_true")
     parser.add_argument("--correct-bias", action="store_true", default=True)
     parser.add_argument("--no-correct-bias", action="store_false", dest="correct_bias")
+    parser.add_argument(
+        "--watch-params",
+        default="flow_operator.t_modulator.2.weight,complex_tucker.feature_grid.channel_proj.bias,complex_tucker.UW.U_imag,flow_operator.operator_tail.2.weight,complex_tucker.UT.U_real",
+    )
+    parser.add_argument("--watch-steps", default="0,1,2")
     args = parser.parse_args()
 
     beta1, beta2 = (float(item.strip()) for item in args.betas.split(","))
@@ -118,6 +238,8 @@ def main() -> int:
     np.save(out_dir / "targets.npy", targets)
 
     params_by_name = _named_parameters(model)
+    watch_params = _parse_csv_list(args.watch_params)
+    watch_steps = {int(item) for item in _parse_csv_list(args.watch_steps)}
     metadata = {
         "checkpoint": args.checkpoint,
         "config": args.config,
@@ -137,6 +259,8 @@ def main() -> int:
             "data_format": "channels_first",
             "correct_bias": args.correct_bias,
         },
+        "watch_params": watch_params,
+        "watch_steps": sorted(watch_steps),
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
@@ -153,6 +277,19 @@ def main() -> int:
         loss = (-psnr).mean()
         loss.backward()
 
+        debug_root = step_dir / "soap_debug"
+        if step_idx in watch_steps:
+            debug_root.mkdir(parents=True, exist_ok=True)
+            group = optimizer.param_groups[0]
+            for name in watch_params:
+                if name not in params_by_name:
+                    continue
+                watched_param = params_by_name[name]
+                debug_arrays, debug_meta = _torch_debug_snapshot(optimizer, watched_param, optimizer.state[watched_param], group)
+                debug_path = debug_root / f"{_param_slug(name)}.npz"
+                _save_npz(debug_path, debug_arrays)
+                (debug_root / f"{_param_slug(name)}.json").write_text(json.dumps({"param_name": name, **debug_meta}, indent=2))
+
         gradients = {
             name: param.grad.detach().cpu().numpy()
             for name, param in sorted(params_by_name.items())
@@ -163,6 +300,24 @@ def main() -> int:
 
         optimizer.step()
         _save_npz(step_dir / "post_params.npz", _tensor_dict_to_numpy(model.state_dict()))
+
+        if step_idx in watch_steps:
+            for name in watch_params:
+                if name not in params_by_name:
+                    continue
+                watched_param = params_by_name[name]
+                debug_path = debug_root / f"{_param_slug(name)}.npz"
+                if not debug_path.exists():
+                    continue
+                with np.load(debug_path) as data:
+                    existing = {key: data[key] for key in data.files}
+                post_arrays, post_meta = _torch_post_state_snapshot(watched_param, optimizer.state[watched_param])
+                existing.update(post_arrays)
+                _save_npz(debug_path, existing)
+                meta_path = debug_root / f"{_param_slug(name)}.json"
+                debug_meta = json.loads(meta_path.read_text())
+                debug_meta.update(post_meta)
+                meta_path.write_text(json.dumps(debug_meta, indent=2))
 
         metrics = {
             "step": step_idx,
