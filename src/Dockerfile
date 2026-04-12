@@ -1,4 +1,5 @@
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+ARG CUDA_IMAGE=nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+FROM ${CUDA_IMAGE}
 
 WORKDIR /app
 
@@ -35,9 +36,7 @@ RUN pip install numpy \
                 scikit-video
 
 # Separate JAX environment. This uses the CUDA 13 plugin packages that matched the
-# working local setup. The current base image remains CUDA 11.8 to preserve the
-# existing Torch workflow; for GPU JAX inside the container, switch the base image
-# to a CUDA 13 compatible runtime.
+# working local setup.
 RUN python3 -m venv /opt/jax13-venv && \
     /opt/jax13-venv/bin/pip install --upgrade pip setuptools wheel && \
     /opt/jax13-venv/bin/pip install \

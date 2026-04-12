@@ -16,20 +16,31 @@ The commands below assume the current best checkpoint is:
 Use two environments:
 
 - Torch / current repo code: the existing Docker Compose container
-- JAX / CUDA 13: the local `.venv-jax13`
+- JAX / CUDA 13: either the local `.venv-jax13` or the CUDA 13 Docker Compose container
 
-The Dockerfile now always installs a separate JAX venv:
+The Dockerfile now supports both CUDA 11.8 and CUDA 13 images through build args. The compose file defines:
+
+- `backend`: CUDA 11.8
+- `backend-jax13`: CUDA 13.0.1
+
+Build the CUDA 13 container with:
 
 ```bash
-docker build -f src/Dockerfile src
+docker compose build backend-jax13
 ```
 
-That installs JAX into `/opt/jax13-venv` with the same package family used in the local working setup. The current base image is still CUDA 11.8, so GPU JAX inside the container also requires moving that image to a CUDA 13 compatible runtime.
+Inside either container, JAX is installed into `/opt/jax13-venv` with the same package family used in the local working setup.
 
 From the repo root:
 
 ```bash
 docker compose run --rm --entrypoint bash backend
+```
+
+For the CUDA 13 container:
+
+```bash
+docker compose run --rm --entrypoint bash backend-jax13
 ```
 
 For JAX commands on the host, use:
