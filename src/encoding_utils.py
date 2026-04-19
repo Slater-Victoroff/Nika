@@ -84,5 +84,7 @@ class FourierEncoding(nn.Module):
             emb = torch.cat([x, cosines, sines], dim=-1)
         else:
             emb = torch.cat([cosines, sines], dim=-1)
-        trunc_emb = emb[:, :self.target_dim]
+        trunc_emb = emb[..., :self.target_dim]
+        if trunc_emb.dim() > 2 and trunc_emb.shape[1] == 1:
+            trunc_emb = trunc_emb.squeeze(1)
         return trunc_emb.contiguous()
