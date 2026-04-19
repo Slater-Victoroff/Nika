@@ -1,3 +1,5 @@
+"""Load frame sequences from on-disk PNG folders into torch tensors."""
+
 import glob
 import torch
 import imageio.v3 as iio
@@ -11,6 +13,18 @@ def load_video_frames(
     normalize=True,
 
 ):
+    """Load up to ``max_frames`` PNG frames from a directory into device memory.
+
+    Args:
+        dir_path: Directory containing numbered PNG frame files.
+        device: Torch device identifier used for the returned tensor.
+        dtype: Tensor dtype to apply to the loaded frames.
+        max_frames: Maximum number of frames to load from the directory.
+        normalize: Whether to scale image intensities into the ``[0, 1]`` range.
+
+    Returns:
+        A tensor shaped ``(T, C, H, W)`` containing the loaded video frames.
+    """
     torch.cuda.set_device(device)
     all_paths = sorted(glob.glob(f"{dir_path}/*.png"))
     if not all_paths:

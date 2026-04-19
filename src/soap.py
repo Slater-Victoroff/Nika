@@ -1,3 +1,5 @@
+"""Implementation of the SOAP optimizer used by the Nika training code."""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -60,6 +62,23 @@ class SOAP(optim.Optimizer):
         data_format: str = "channels_first",
         correct_bias: bool = True,
     ):
+        """Initialize the SOAP optimizer and its preconditioning settings.
+
+        Args:
+            params: Iterable of parameters or optimizer parameter groups.
+            lr: Base learning rate.
+            betas: Exponential moving-average coefficients for Adam-style moments.
+            shampoo_beta: Optional EMA coefficient for the Shampoo preconditioner.
+            eps: Numerical stability constant used in the denominator.
+            weight_decay: Decoupled weight-decay coefficient.
+            precondition_frequency: Frequency, in steps, for refreshing eigenbases.
+            max_precond_dim: Maximum dimension allowed for a preconditioner matrix.
+            merge_dims: Whether to reshape tensors to keep preconditioners tractable.
+            precondition_1d: Whether to precondition 1D gradients.
+            normalize_grads: Whether to normalize projected gradients per layer.
+            data_format: Layout hint for convolutional gradients.
+            correct_bias: Whether to apply Adam-style bias correction.
+        """
         defaults = {
             "lr": lr,
             "betas": betas,
@@ -78,7 +97,14 @@ class SOAP(optim.Optimizer):
         
     def merge_dims(self, grad, max_precond_dim):
         """
-        Merges dimensions of the gradient tensor till the product of the dimensions is less than or equal to max_precond_dim.
+        Merge gradient dimensions until each merged axis fits the preconditioner limit.
+
+        Args:
+            grad: Gradient tensor whose dimensions may need collapsing.
+            max_precond_dim: Maximum dimension permitted for one preconditioner axis.
+
+        Returns:
+            A reshaped gradient tensor with merged dimensions when needed.
         """
         assert self._data_format in ["channels_first", "channels_last"]
         if self._data_format == "channels_last" and grad.dim() == 4:
@@ -108,10 +134,13 @@ class SOAP(optim.Optimizer):
     @torch.no_grad()
     def step(self, closure = None):
         """
-        Performs a single optimization step.
+        Perform one SOAP optimization step across all parameter groups.
 
-        Arguments:
-            closure (`Callable`, *optional*): A closure that reevaluates the model and returns the loss.
+        Args:
+            closure: Optional callable that reevaluates the model and returns the loss.
+
+        Returns:
+            The loss returned by ``closure`` when provided, otherwise ``None``.
         """
         if closure is None:
             loss = None
@@ -215,7 +244,16 @@ class SOAP(optim.Optimizer):
                             shampoo_beta=0.95, max_precond_dim=10000, precondition_1d=False,
                             merge_dims=False):
         """
-        Initializes the preconditioner matrices (L and R in the paper).
+        Initialize the Shampoo-style preconditioner state for one parameter tensor.
+
+        Args:
+            grad: Gradient tensor that defines the parameter shape.
+            state: Optimizer state dictionary for the parameter tensor.
+            precondition_frequency: Refresh frequency for the eigenbases.
+            shampoo_beta: EMA coefficient used for the Gram matrices.
+            max_precond_dim: Maximum dimension allowed for a preconditioner matrix.
+            precondition_1d: Whether to precondition 1D gradients.
+            merge_dims: Whether to merge tensor dimensions before allocating preconditioners.
         """
         state['GG'] = [] # Will hold all the preconditioner matrices (L and R in the paper).
         if grad.dim() == 1:
@@ -239,7 +277,16 @@ class SOAP(optim.Optimizer):
         
     def project(self, grad, state, merge_dims=False, max_precond_dim=10000):
         """
-        Projects the gradient to the eigenbases of the preconditioner.
+        Project a gradient tensor into the current preconditioner eigenbases.
+
+        Args:
+            grad: Gradient tensor to project.
+            state: Optimizer state dictionary holding the current eigenbases.
+            merge_dims: Whether to merge tensor dimensions before projection.
+            max_precond_dim: Maximum dimension permitted after merging.
+
+        Returns:
+            The projected gradient tensor.
         """
         original_shape = grad.shape
         if merge_dims:
@@ -268,7 +315,14 @@ class SOAP(optim.Optimizer):
     def update_preconditioner(self, grad, state, 
                               max_precond_dim=10000, merge_dims=False, precondition_1d=False):
         """
-        Updates the preconditioner matrices and the eigenbases (L, R, Q_L, Q_R in the paper).
+        Update the Gram matrices and refresh eigenbases when scheduled.
+
+        Args:
+            grad: Latest gradient tensor for the parameter.
+            state: Optimizer state dictionary for the parameter tensor.
+            max_precond_dim: Maximum dimension allowed for a preconditioner matrix.
+            merge_dims: Whether to merge tensor dimensions before updating.
+            precondition_1d: Whether to track preconditioners for 1D gradients.
         """
         if state["Q"] is not None:
             state["exp_avg"] = self.project_back(state["exp_avg"], state, merge_dims=merge_dims, max_precond_dim=max_precond_dim)
@@ -308,7 +362,16 @@ class SOAP(optim.Optimizer):
 
     def project_back(self, grad, state, merge_dims=False, max_precond_dim=10000):
         """
-        Projects the gradient back to the original space.
+        Map a projected gradient back into the parameter's original basis.
+
+        Args:
+            grad: Gradient tensor currently expressed in the eigenbasis space.
+            state: Optimizer state dictionary holding the current eigenbases.
+            merge_dims: Whether merged tensor dimensions should be reconstructed.
+            max_precond_dim: Maximum dimension permitted after merging.
+
+        Returns:
+            The gradient tensor transformed back into parameter space.
         """
         original_shape = grad.shape
         if merge_dims:
@@ -336,7 +399,13 @@ class SOAP(optim.Optimizer):
 
     def get_orthogonal_matrix(self, mat):
         """
-        Computes the eigenbases of the preconditioner using torch.linalg.eigh decomposition.
+        Compute exact eigenbases for the stored preconditioner matrices.
+
+        Args:
+            mat: List of preconditioner matrices to diagonalize.
+
+        Returns:
+            A list of orthogonal eigenbasis matrices aligned with ``mat``.
         """
         matrix = []
         for m in mat:
@@ -372,8 +441,15 @@ class SOAP(optim.Optimizer):
 
     def get_orthogonal_matrix_QR(self, state, max_precond_dim=10000, merge_dims=False):
         """
-        Computes the eigenbases of the preconditioner using one round of power iteration 
-        followed by torch.linalg.qr decomposition.
+        Refresh eigenbases using one power-iteration step followed by QR.
+
+        Args:
+            state: Optimizer state dictionary containing preconditioner statistics.
+            max_precond_dim: Maximum dimension allowed for merged tensor axes.
+            merge_dims: Whether merged tensor dimensions should be used.
+
+        Returns:
+            Updated orthogonal eigenbasis matrices.
         """
         precond_list = state['GG']
         orth_list = state['Q']

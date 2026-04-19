@@ -1,3 +1,5 @@
+"""Rank-analysis utilities for videos, feature grids, and FFT-derived tensors."""
+
 import torch
 import torch.nn.functional as F
 import math
@@ -5,12 +7,31 @@ import math
 from nika import load_video_frames
 
 def _unfold(x: torch.Tensor, mode: int) -> torch.Tensor:
+    """Unfold a 4D tensor along one mode into a matrix.
+
+    Args:
+        x: Tensor shaped like ``(T, C, H, W)``.
+        mode: Axis to move to the matrix row dimension.
+
+    Returns:
+        A 2D matrix view of the tensor for singular-value analysis.
+    """
     x = x.movedim(mode, 0)
     return x.reshape(x.shape[0], -1)
 
 
 @torch.no_grad()
 def _top_svals(A: torch.Tensor, k: int, niter: int = 2) -> torch.Tensor:
+    """Compute the leading singular values of a matrix with ``torch.svd_lowrank``.
+
+    Args:
+        A: Matrix to analyze.
+        k: Maximum number of singular values to return.
+        niter: Power-iteration count passed to ``torch.svd_lowrank``.
+
+    Returns:
+        A tensor of up to ``k`` singular values in descending order.
+    """
     # Keep wrapper for small/straightforward cases; prefer svd_lowrank when
     # the entire unfolding fits comfortably in memory.
     m, n = A.shape
@@ -25,10 +46,15 @@ def _top_svals(A: torch.Tensor, k: int, niter: int = 2) -> torch.Tensor:
 
 def _top_svals_via_gram(A: torch.Tensor, k: int, chunk_cols: int = 65536) -> torch.Tensor:
     """
-    Compute top singular values for unfolding A (shape [d, M]) by forming
-    the Gram matrix G = A @ A.T in column chunks. This avoids creating
-    large intermediate matrices when M is huge (spatial dims).
-    Returns descending singular values (float32).
+    Compute leading singular values by accumulating a Gram matrix in chunks.
+
+    Args:
+        A: Matrix shaped ``(d, M)`` whose singular spectrum should be estimated.
+        k: Maximum number of singular values to return.
+        chunk_cols: Number of columns to process per Gram-matrix accumulation chunk.
+
+    Returns:
+        A float32 tensor of descending singular values.
     """
     d, M = A.shape
     if M == 0:
@@ -55,8 +81,15 @@ def _top_svals_via_gram(A: torch.Tensor, k: int, chunk_cols: int = 65536) -> tor
 
 def _top_svecs_via_gram(A: torch.Tensor, k: int, chunk_cols: int = 65536):
     """
-    Return top-k left singular vectors and singular values for A (d, M) using Gram.
-    Returns (U, svals) where U is (d, k) (float32) and svals length k.
+    Compute leading left singular vectors and values via a chunked Gram matrix.
+
+    Args:
+        A: Matrix shaped ``(d, M)`` to analyze.
+        k: Number of singular vectors and values to return.
+        chunk_cols: Number of columns to process per Gram-matrix chunk.
+
+    Returns:
+        A tuple ``(U, svals)`` containing left singular vectors and singular values.
     """
     d, M = A.shape
     if M == 0 or k <= 0:
@@ -81,9 +114,16 @@ def _top_svecs_via_gram(A: torch.Tensor, k: int, chunk_cols: int = 65536):
 
 def _top_svals_via_gram_from_tensor(x: torch.Tensor, mode: int, k: int, chunk_cols: int = 65536):
     """
-    Compute top singular values for mode-unfolding of 4D tensor `x` without
-    constructing the full unfolding. Tiles the other dims to accumulate the
-    Gram matrix G = A @ A.T in chunks.
+    Estimate singular values for a 4D tensor unfolding without materializing it.
+
+    Args:
+        x: Input 4D tensor to analyze.
+        mode: Tensor mode whose unfolding should be inspected.
+        k: Maximum number of singular values to return.
+        chunk_cols: Approximate unfolding-column budget per accumulation step.
+
+    Returns:
+        A tensor of descending singular values for the requested unfolding.
     """
     assert x.ndim == 4
     dims = list(x.shape)
@@ -122,15 +162,31 @@ def _top_svals_via_gram_from_tensor(x: torch.Tensor, mode: int, k: int, chunk_co
 
 
 def _unfold_3d(x: torch.Tensor, mode: int) -> torch.Tensor:
+    """Unfold a 3D tensor along one mode into a matrix.
+
+    Args:
+        x: Tensor shaped like ``(C, H, W)``.
+        mode: Axis to move to the matrix row dimension.
+
+    Returns:
+        A 2D matrix view of the tensor for singular-value analysis.
+    """
     x = x.movedim(mode, 0)
     return x.reshape(x.shape[0], -1)
 
 
 def _top_svals_via_gram_from_tensor_3d(x: torch.Tensor, mode: int, k: int, chunk_cols: int = 65536):
     """
-    Compute top singular values for mode-unfolding of 3D tensor `x` without
-    constructing the full unfolding. Tiles the other dims to accumulate the
-    Gram matrix G = A @ A.T in chunks.
+    Estimate singular values for a 3D tensor unfolding without materializing it.
+
+    Args:
+        x: Input 3D tensor to analyze.
+        mode: Tensor mode whose unfolding should be inspected.
+        k: Maximum number of singular values to return.
+        chunk_cols: Approximate unfolding-column budget per accumulation step.
+
+    Returns:
+        A tensor of descending singular values for the requested unfolding.
     """
     assert x.ndim == 3
     dims = list(x.shape)
@@ -171,6 +227,17 @@ def rank_estimate_3d(
     kmax: tuple[int, int, int] = (256, 256, 256),
     rmax: tuple[int | None, int | None, int | None] = (512, 512, 512),
 ):
+    """Estimate Tucker-style ranks for a 3D feature tensor.
+
+    Args:
+        feature_tensor: Tensor shaped ``(C, H, W)`` to analyze.
+        energy: Cumulative singular-value energy target per mode.
+        kmax: Maximum number of singular values to compute per mode.
+        rmax: Optional upper bound on the selected rank per mode.
+
+    Returns:
+        A tuple ``(ranks, svals)`` containing estimated ranks and singular spectra.
+    """
     assert feature_tensor.ndim == 3, "expected (C,H,W)"
     C, H, W = feature_tensor.shape
     dev = feature_tensor.device
@@ -204,8 +271,19 @@ def tune_energy_for_center_3d(
     **rank_kwargs,
 ):
     """
-    Binary-search energy threshold so that product(ranks) approximates center_target.
-    Returns (energy, ranks, product, svals).
+    Tune the energy threshold so the 3D rank product approaches a target size.
+
+    Args:
+        feature_tensor: Tensor shaped ``(C, H, W)`` to analyze.
+        center_target: Desired product of the estimated mode ranks.
+        energy_lo: Lower bound of the energy-search interval.
+        energy_hi: Upper bound of the energy-search interval.
+        tol: Relative tolerance for the rank-product target.
+        max_iters: Maximum number of binary-search iterations to run.
+        **rank_kwargs: Additional keyword arguments forwarded to ``rank_estimate_3d``.
+
+    Returns:
+        The best ``(energy, ranks, product, svals)`` tuple found during the search.
     """
     lo = energy_lo
     hi = energy_hi
@@ -238,8 +316,14 @@ def tune_energy_for_center_3d(
 
 def estimate_feature_grid_rank(feature_grid: torch.Tensor, k: int = 128) -> torch.Tensor:
     """
-    Estimate the rank of a feature grid (C, H, W) by computing top singular values
-    of the unfolded matrix (C, H*W).
+    Estimate the feature-grid spectrum via a channel-vs-space unfolding.
+
+    Args:
+        feature_grid: Tensor shaped ``(C, H, W)``.
+        k: Maximum number of singular values to return.
+
+    Returns:
+        Leading singular values of the unfolded feature grid.
     """
     assert feature_grid.ndim == 3, "expected (C, H, W)"
     A = feature_grid.reshape(feature_grid.shape[0], -1)  # (C, H*W)
@@ -253,10 +337,16 @@ def rank_estimate_grid4d(
     rmax: tuple[int | None, int | None, int | None, int | None] = (128, None, 512, 512),
 ):
     """
-    Estimate Tucker ranks for a feature grid shaped (T, C, H, W). This treats
-    `C` as the feature dimension and includes the temporal axis `T` in the
-    per-mode rank estimation.
-    Returns (ranks, svals) where svals is a list of singular-value tensors per mode.
+    Estimate Tucker-style ranks for a feature grid shaped ``(T, C, H, W)``.
+
+    Args:
+        grid_tensor: Feature-grid tensor to analyze.
+        energy: Cumulative singular-value energy target per mode.
+        kmax: Maximum number of singular values to compute per mode.
+        rmax: Optional upper bound on the selected rank per mode.
+
+    Returns:
+        A tuple ``(ranks, svals)`` containing estimated ranks and singular spectra.
     """
     assert grid_tensor.ndim == 4, "expected (T, C, H, W)"
     T, C, H, W = grid_tensor.shape
@@ -293,8 +383,19 @@ def tune_energy_for_center_grid4d(
     **rank_kwargs,
 ):
     """
-    Binary-search energy threshold so that product(ranks) approximates center_target
-    for a (T,C,H,W) feature grid. Returns (energy, ranks, product, svals).
+    Tune the energy threshold so the 4D grid rank product approaches a target size.
+
+    Args:
+        grid_tensor: Feature-grid tensor shaped ``(T, C, H, W)``.
+        center_target: Desired product of the estimated mode ranks.
+        energy_lo: Lower bound of the energy-search interval.
+        energy_hi: Upper bound of the energy-search interval.
+        tol: Relative tolerance for the rank-product target.
+        max_iters: Maximum number of binary-search iterations to run.
+        **rank_kwargs: Additional keyword arguments forwarded to ``rank_estimate_grid4d``.
+
+    Returns:
+        The best ``(energy, ranks, product, svals)`` tuple found during the search.
     """
     lo = energy_lo
     hi = energy_hi
@@ -321,8 +422,16 @@ def tune_energy_for_center_grid4d(
 
 def deflate_tensor(video_tensor: torch.Tensor, remove_ranks: tuple[int, int, int, int], chunk_cols: int = 65536, compute_device: str = 'cpu') -> torch.Tensor:
     """
-    Project out the top `remove_ranks[mode]` left singular vectors from each mode
-    (separately) and return the residual tensor. Works on CPU by default.
+    Remove leading singular components from each unfolding of a 4D video tensor.
+
+    Args:
+        video_tensor: Input tensor shaped ``(T, C, H, W)``.
+        remove_ranks: Number of leading singular directions to remove per mode.
+        chunk_cols: Approximate unfolding-column budget per accumulation step.
+        compute_device: Device on which to perform the deflation work.
+
+    Returns:
+        The residual tensor after per-mode deflation.
     """
     assert video_tensor.ndim == 4
     T, C, H, W = video_tensor.shape
@@ -353,8 +462,15 @@ def deflate_tensor(video_tensor: torch.Tensor, remove_ranks: tuple[int, int, int
 
 def deflate_and_reestimate(video_tensor: torch.Tensor, remove_ranks: tuple[int, int, int, int], **rank_kwargs):
     """
-    Remove top `remove_ranks` components and re-run rank_estimate on the residual.
-    Returns (orig_ranks, residual_ranks, orig_svals, residual_svals).
+    Deflate leading components from a video tensor and recompute its rank estimate.
+
+    Args:
+        video_tensor: Input tensor shaped ``(T, C, H, W)``.
+        remove_ranks: Number of leading singular directions to remove per mode.
+        **rank_kwargs: Keyword arguments forwarded to ``rank_estimate``.
+
+    Returns:
+        A tuple containing original ranks, residual ranks, and both singular spectra.
     """
     # compute original ranks/svals
     orig_ranks, orig_svals = rank_estimate(video_tensor, **rank_kwargs)
@@ -366,6 +482,17 @@ def deflate_and_reestimate(video_tensor: torch.Tensor, remove_ranks: tuple[int, 
 
 
 def _rank_for_energy(s: torch.Tensor, energy: float, rmin: int = 1, rmax: int | None = None) -> int:
+    """Choose the smallest rank whose cumulative energy clears a target.
+
+    Args:
+        s: Singular values in descending order.
+        energy: Desired cumulative energy fraction.
+        rmin: Minimum rank to return.
+        rmax: Optional maximum rank to consider.
+
+    Returns:
+        The selected rank clipped to the requested bounds.
+    """
     if s.numel() == 0:
         return rmin
     if rmax is None:
@@ -392,6 +519,18 @@ def rank_estimate(
     kmax: tuple[int, int, int, int] = (128, 3, 256, 256),
     rmax: tuple[int | None, int | None, int | None, int | None] = (128, None, 512, 512),
 ):
+    """Estimate Tucker-style ranks for a video tensor.
+
+    Args:
+        video_tensor: Video tensor shaped ``(T, C, H, W)``.
+        frame_sample: Optional number of frames to subsample before analysis.
+        energy: Cumulative singular-value energy target per mode.
+        kmax: Maximum number of singular values to compute per mode.
+        rmax: Optional upper bound on the selected rank per mode.
+
+    Returns:
+        A tuple ``(ranks, svals)`` containing estimated ranks and singular spectra.
+    """
     assert video_tensor.ndim == 4, "expected (T,C,H,W)"
     T, C, H, W = video_tensor.shape
     dev = video_tensor.device
@@ -438,8 +577,19 @@ def tune_energy_for_center(
     **rank_kwargs,
 ):
     """
-    Binary-search energy threshold so that product(ranks) approximates center_target.
-    Returns (energy, ranks, product, svals).
+    Tune the energy threshold so the video rank product approaches a target size.
+
+    Args:
+        video_tensor: Input tensor shaped ``(T, C, H, W)``.
+        center_target: Desired product of the estimated mode ranks.
+        energy_lo: Lower bound of the energy-search interval.
+        energy_hi: Upper bound of the energy-search interval.
+        tol: Relative tolerance for the rank-product target.
+        max_iters: Maximum number of binary-search iterations to run.
+        **rank_kwargs: Additional keyword arguments forwarded to ``rank_estimate``.
+
+    Returns:
+        The best ``(energy, ranks, product, svals)`` tuple found during the search.
     """
     lo = energy_lo
     hi = energy_hi
@@ -472,16 +622,35 @@ def tune_energy_for_center(
 
 def run_rank_analysis(video_tensor: torch.Tensor, center_target: int = 750000, compute_device: str = 'cpu'):
     """
-    Run tuning on several representations independently and return a dict of results.
-    Representations: 'real', 'fft_real', 'fft_imag', 'fft_mag', 'fft_complex'
+    Run the repo's multi-representation rank analysis workflow on one video.
+
+    Args:
+        video_tensor: Input tensor shaped ``(T, C, H, W)``.
+        center_target: Target rank-product size used by the tuning routines.
+        compute_device: Device hint forwarded to downstream compute helpers.
+
+    Returns:
+        A mapping from representation name to ``(energy, ranks, product, svals)``.
     """
     results = {}
     vid = video_tensor.cpu()
 
     def _log_repr_stats(name: str, x: torch.Tensor):
+        """Print summary statistics for one analyzed representation.
+
+        Args:
+            name: Label for the representation being logged.
+            x: Tensor whose shape and value range should be reported.
+        """
         print(f"[{name}] shape={tuple(x.shape)}, min={x.min():.6f}, max={x.max():.6f}, mean={x.mean():.6f}, std={x.std(unbiased=False):.6f}")
 
     def _log_svals(name: str, svals_list):
+        """Print top singular values for each mode of one representation.
+
+        Args:
+            name: Label for the representation being logged.
+            svals_list: Sequence of singular-value tensors, one per mode.
+        """
         print(f"SVals for {name}:")
         for mi, s in enumerate(svals_list):
             s = s.detach().cpu()
@@ -494,6 +663,15 @@ def run_rank_analysis(video_tensor: torch.Tensor, center_target: int = 750000, c
     _log_repr_stats('real', vid)
     # normalize per-channel for stability (video already scaled in main)
     def _zscore_per_channel(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """Normalize a video tensor independently for each channel.
+
+        Args:
+            x: Tensor shaped ``(T, C, H, W)``.
+            eps: Numerical floor applied to the per-channel standard deviation.
+
+        Returns:
+            The channel-wise z-scored tensor.
+        """
         mean = x.mean(dim=(0, 2, 3), keepdim=True)
         std = x.std(dim=(0, 2, 3), unbiased=False, keepdim=True).clamp_min(eps)
         return (x - mean) / std
