@@ -170,15 +170,14 @@ def benchmark_encoding_decoding_and_macs(
     vid_name,
     config,
     device,
-    n_frames=300,
-    batch_size=1,
-    warmup_iters=10,
-    repeats=50,
+    batch_size=2,
+    warmup_iters=5,
+    repeats=10,
 ):
     if "cuda" not in device:
         raise ValueError("This benchmark uses CUDA events; please use a CUDA device.")
 
-    vid = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=n_frames, dtype=torch.uint8, normalize=False)
+    vid = load_video_frames(f"{basedir}/{vid_name}", device, dtype=torch.uint8, normalize=False)
     model = get_best_model(f"models/ref_models/", vid.shape, vid_name, config, device)
 
     # make two independent module instances so train/eval modes don't interfere
@@ -188,11 +187,8 @@ def benchmark_encoding_decoding_and_macs(
 
     eval_model = copy.deepcopy(model)
     eval_model.eval()
-    eval_model = torch.compile(eval_model, mode="reduce-overhead")
 
     num_frames = int(vid.shape[0])
-    if batch_size != 1:
-        raise ValueError("This benchmark runs one frame at a time; set batch_size=1.")
 
     norm_t_all = torch.linspace(0.0, 1.0, steps=num_frames, device=device, dtype=torch.float32)
 
@@ -202,6 +198,7 @@ def benchmark_encoding_decoding_and_macs(
     else:
         sample_idx = torch.randint(0, num_frames, (batch_size,), device=device)
         sample_norm_t = (sample_idx.float() / (num_frames - 1)).requires_grad_(True)
+        # Use uncompiled model for FlopCounterMode to avoid torch.compile hook warnings
         with torch.enable_grad(), FlopCounterMode(display=False) as fcm:
             _ = eval_model(sample_norm_t)
         try:
@@ -213,18 +210,29 @@ def benchmark_encoding_decoding_and_macs(
         else:
             macs_str = f"{(total_flops / 2.0):.3e}"
 
-    # PSNR (full series, one frame at a time)
-    total_psnr = 0.0
+    # PSNR over the full sequence (batched):
+    #  - avg_frame_psnr: mean of per-frame PSNR values
+    total_frame_psnr = 0.0
+    total_frames_psnr = 0
+    num_eval_batches = (num_frames + batch_size - 1) // batch_size
     with torch.no_grad():
-        for i in range(num_frames):
-            batch_gt = vid[i:i + 1].to(torch.float32) / 255.0
-            pred = eval_model(norm_t_all[i:i + 1])
-            mse = F.mse_loss(pred, batch_gt)
-            psnr = -10.0 * torch.log10(mse + 1e-8)
-            total_psnr += psnr.item()
-    psnr_val = total_psnr / float(num_frames)
+        for batch_idx in range(num_eval_batches):
+            min_t = batch_idx * batch_size
+            max_t = min((batch_idx + 1) * batch_size, num_frames)
+            batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
+            batch_norm_t = norm_t_all[min_t:max_t]
+            pred = eval_model(batch_norm_t).clamp(0, 1)
 
-    # Profile trace (decode forward only)
+            sqe = (pred - batch_gt) ** 2
+            frame_mse = sqe.view(sqe.shape[0], -1).mean(dim=1)
+            frame_psnr = 10.0 * torch.log10(1.0 / (frame_mse + 1e-8))
+            total_frame_psnr += frame_psnr.sum().item()
+            total_frames_psnr += frame_psnr.numel()
+
+    avg_frame_psnr = total_frame_psnr / float(max(1, total_frames_psnr))
+
+    # Profile trace (decode forward only) — use uncompiled model so profiler
+    # captures real op-level breakdown rather than compiled kernel fusions.
     trace_dir = os.path.join("profiles", "encoding_decoding_benchmark")
     os.makedirs(trace_dir, exist_ok=True)
     with torch.no_grad(), torch.profiler.profile(
@@ -232,11 +240,15 @@ def benchmark_encoding_decoding_and_macs(
         record_shapes=True,
         profile_memory=True,
         with_stack=False,
+        acc_events=True,
         on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir),
     ) as prof:
         for i in range(min(num_frames, 5)):
             _ = eval_model(norm_t_all[i:i + 1])
             prof.step()
+
+    # Compile model for timing runs (after profiling and MAC counting to avoid hook warnings)
+    eval_model = torch.compile(eval_model, mode="reduce-overhead")
 
     # Decode speed (forward-only)
     with torch.no_grad():
@@ -262,45 +274,62 @@ def benchmark_encoding_decoding_and_macs(
     decode_avg_ms = total_ms / repeats
     decode_fps = (total_frames / repeats) / (decode_avg_ms / 1000.0)
 
-    # Encode speed (training iter: forward + PSNR loss + backward, no optimizer step)
+    # Encode speed (training iter: forward + PSNR loss + backward + optimizer step, batched like nika.py)
     opt = SOAP(encoding_model.parameters(), lr=1e-2, weight_decay=0)
 
-    def _train_iter(idx):
-        batch_gt = vid[idx].to(torch.float32) / 255.0
-        prediction = encoding_model(norm_t_all[idx])
-        mse = F.mse_loss(prediction.squeeze(0), batch_gt)
-        psnr = -10.0 * torch.log10(mse + 1e-8)
-        loss = (-psnr).mean()
+    # Match nika.py batching: accumulate gradients over a batch, then step
+    train_batch_size = batch_size  # use same batch_size as encode/decode phases
+    num_train_batches = (num_frames + train_batch_size - 1) // train_batch_size
+
+    # Pre-load and convert all GT frames to float on GPU to avoid CPU->GPU transfers during timing
+    vid_float = (vid.to(torch.float32) / 255.0)
+
+    def _train_epoch_gpu():
+        """One full epoch: forward + backward on GPU only (GT already on GPU)."""
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        epoch_loss = 0.0
+        for batch_idx in range(num_train_batches):
+            min_t = batch_idx * train_batch_size
+            max_t = min((batch_idx + 1) * train_batch_size, num_frames)
+            batch_gt = vid_float[min_t:max_t]
+            batch_norm_t = norm_t_all[min_t:max_t]
+            prediction = encoding_model(batch_norm_t)
+            mse = F.mse_loss(prediction, batch_gt)
+            psnr = -10.0 * torch.log10(mse + 1e-8)
+            # Scale loss by batch count to normalize accumulated gradient
+            batch_loss = (-psnr).mean() / num_train_batches
+            batch_loss.backward()
+            epoch_loss += batch_loss.item()
+        opt.step()
+        return epoch_loss
 
     with torch.enable_grad():
         for _ in range(warmup_iters):
-            for i in range(num_frames):
-                _train_iter(i)
+            _train_epoch_gpu()
 
     total_ms = 0.0
-    total_iters = 0
+    total_epochs = 0
+    total_frames_encoded = 0
     with torch.enable_grad():
         for _ in range(repeats):
             torch.cuda.synchronize(device)
             starter.record()
-            for i in range(num_frames):
-                _train_iter(i)
+            _train_epoch_gpu()
             ender.record()
             torch.cuda.synchronize(device)
             total_ms += starter.elapsed_time(ender)
-            total_iters += num_frames
+            total_epochs += 1
+            total_frames_encoded += num_frames
 
-    encode_avg_ms = total_ms / max(1, total_iters)
-    encode_iters_per_sec = 1000.0 / encode_avg_ms
+    encode_avg_ms = total_ms / max(1, total_epochs)
+    encode_fps = (total_frames_encoded / total_epochs) / (encode_avg_ms / 1000.0)
 
     print(
         " | ".join([
-            f"Encoding speed: {encode_iters_per_sec:.2f} iters/s ({encode_avg_ms:.2f} ms/iter)",
+            f"Encoding speed: {encode_fps:.2f} fps ({encode_avg_ms:.2f} ms/epoch)",
             f"Decoding speed: {decode_fps:.2f} fps ({decode_avg_ms:.2f} ms/{num_frames} frames)",
             f"MACs per forward: {macs_str}",
-            f"PSNR (batch): {psnr_val:.2f} dB",
+            f"PSNR (avg frame): {avg_frame_psnr:.2f} dB",
             f"Profile: {trace_dir}",
         ])
     )
@@ -434,15 +463,15 @@ def module_visualization(basedir, vid_name, n_frames, config, device, variants=N
 
 
 if __name__ == "__main__":
-    device = "cuda:1"
+    device = "cuda:0"
     name = "bunny"
-    n_frames = 132
+    # n_frames = 132
     config = "small"
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     # module_visualization("static/benchmarks/uvg", name, n_frames=300, config=config, device=device)
-    benchmark_encoding_decoding_and_macs("static/benchmarks", name, config, device, n_frames=n_frames, batch_size=1)
+    benchmark_encoding_decoding_and_macs("static/benchmarks", name, config, device, batch_size=2)
     # benchmark_psnr("static/benchmarks/uvg", name, config, device)
     # make_mp4(f"visuals/{name}/{config}/preds", output_path=f"visuals/{name}/{config}/preds/output.mp4", base_name="pred_frame", fps=24)
     # make_mp4(f"visuals/{name}/{config}/residual", output_path=f"visuals/{name}/{config}/residual/output.mp4", base_name="residual_frame", fps=24)

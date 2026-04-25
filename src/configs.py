@@ -9,14 +9,14 @@ REFERENCES = {
     },
     "xxs": {
         "grid_ranks": [1, 270, 480],
-        "real_tucker_ranks": [2, 40, 40, 40],
-        "complex_tucker_ranks": [2, 30, 30, 30],
+        "real_tucker_ranks": [2, 45, 45, 45],
+        "complex_tucker_ranks": [2, 40, 40, 40],
         "conv_hidden": 48,
     },
     "xs": {
         "grid_ranks": [2, 270, 480],
         "real_tucker_ranks": [3, 50, 50, 50],
-        "complex_tucker_ranks": [3, 40, 40, 40],
+        "complex_tucker_ranks": [3, 45, 45, 45],
         "conv_hidden": 48,
     },
     "small": {

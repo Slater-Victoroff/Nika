@@ -9,7 +9,6 @@ def load_video_frames(
     dir_path,
     device="cuda",
     dtype=torch.float32,
-    max_frames=100,
     normalize=True,
 
 ):
@@ -19,20 +18,15 @@ def load_video_frames(
         dir_path: Directory containing numbered PNG frame files.
         device: Torch device identifier used for the returned tensor.
         dtype: Tensor dtype to apply to the loaded frames.
-        max_frames: Maximum number of frames to load from the directory.
         normalize: Whether to scale image intensities into the ``[0, 1]`` range.
 
     Returns:
         A tensor shaped ``(T, C, H, W)`` containing the loaded video frames.
     """
     torch.cuda.set_device(device)
-    all_paths = sorted(glob.glob(f"{dir_path}/*.png"))
-    if not all_paths:
+    paths = sorted(glob.glob(f"{dir_path}/*.png"))
+    if not paths:
         raise RuntimeError(f"No frames found in {dir_path}")
-    if len(all_paths) <= max_frames:
-        paths = all_paths
-    else:
-        paths = all_paths[:max_frames]
     first = iio.imread(paths[0], plugin="pillow")
     H, W = first.shape[:2]
 

@@ -42,6 +42,7 @@ class FourierEncoding(nn.Module):
         target_dim: int,
         max_freq = 1,
         freq_init="uniform",
+        init_mode="random",
         include_raw:bool=True,
         learnable_freqs:bool=True,
         device='cuda'
@@ -51,7 +52,8 @@ class FourierEncoding(nn.Module):
         Args:
             target_dim: Width of the generated encoding vector.
             max_freq: Highest initial frequency magnitude before scaling by ``2π``.
-            freq_init: Strategy used to initialize the learnable frequencies.
+            freq_init: Distribution family for the initialized frequencies (``uniform`` or ``log``).
+            init_mode: Whether to sample frequencies randomly or place them on a linear grid.
             include_raw: Whether to prepend the raw coordinate to the embedding.
             learnable_freqs: Whether the frequency coefficients should be trainable.
             device: Device on which to allocate the frequency parameters.
@@ -59,13 +61,27 @@ class FourierEncoding(nn.Module):
         super().__init__()
         self.target_dim = target_dim
         freq_dim = ((target_dim - int(include_raw)) // 2) + 1  # +1 for padding with odd target_dim
-        adj_max_freq = max_freq * 2 * torch.pi
+        adj_max_freq = float(max_freq * 2 * torch.pi)
+
+        if init_mode == "random":
+            base = torch.rand(freq_dim, device=device)
+        elif init_mode == "linear":
+            base = torch.linspace(0.0, 1.0, steps=freq_dim, device=device)
+        else:
+            raise ValueError(f"Unsupported init_mode: {init_mode}")
+
         if freq_init == "uniform":
-            self.freqs = nn.Parameter(torch.rand(freq_dim, device=device) * adj_max_freq, requires_grad=learnable_freqs)
+            freqs = base * adj_max_freq
         elif freq_init == "log":
-            self.freqs = nn.Parameter(torch.exp(torch.rand(freq_dim, device=device) * math.log(adj_max_freq)), requires_grad=learnable_freqs)
+            if adj_max_freq <= 0.0:
+                raise ValueError("max_freq must be positive when freq_init='log'")
+            log_min = min(0.0, math.log(adj_max_freq))
+            log_max = max(0.0, math.log(adj_max_freq))
+            freqs = torch.exp(log_min + base * (log_max - log_min))
         else:
             raise ValueError(f"Unsupported freq_init: {freq_init}")
+
+        self.freqs = nn.Parameter(freqs, requires_grad=learnable_freqs)
         self.include_raw = include_raw
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
