@@ -103,10 +103,10 @@ def export_config(config_name, target_shape, k=4, device="cpu"):
 
     # Build kwargs, handling optional parameters
     model_kwargs = {}
-    if "grid_ranks" in config:
-        model_kwargs["grid_ranks"] = config["grid_ranks"]
+    if "base_grid_channels" in config:
+        model_kwargs["base_grid_channels"] = config["base_grid_channels"]
     else:
-        model_kwargs["grid_ranks"] = [0, 0, 0, 0]  # Will be skipped
+        model_kwargs["base_grid_channels"] = 0
 
     if "real_tucker_ranks" in config:
         model_kwargs["real_tucker_ranks"] = config["real_tucker_ranks"]

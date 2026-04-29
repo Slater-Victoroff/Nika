@@ -11,14 +11,14 @@ from configs import REFERENCES
 
 
 class RealNika(nn.Module):
-    def __init__(self, target_shape, k, real_tucker_ranks, grid_ranks, conv_hidden, out_channels, device):
+    def __init__(self, target_shape, k, real_tucker_ranks, base_grid_channels, conv_hidden, out_channels, device):
         """Assemble the real-grid ablation model.
 
         Args:
             target_shape: Full ``[C, H, W, T]`` shape of the target video tensor.
             k: Spatial downsampling and pixel-shuffle upsampling factor.
             real_tucker_ranks: Tucker ranks for the real-domain factorization branch.
-            grid_ranks: Feature-grid resolution used for the learned spatial grid branch.
+            base_grid_channels: Channel width for the learned spatial grid branch.
             conv_hidden: Hidden width for the refinement CNN.
             out_channels: Number of image channels to predict.
             device: Device on which to allocate the module.
@@ -34,7 +34,7 @@ class RealNika(nn.Module):
         ).to(device)
         self.feature_grid = FeatureGrid(
             target_shape=self.internal_shape,
-            grid_res=grid_ranks,
+            grid_res=[base_grid_channels, self.H, self.W],
             device=device,
         ).to(device)
         
@@ -82,7 +82,7 @@ class RealNika(nn.Module):
 
 
 class TuckerNika(nn.Module):
-    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, conv_hidden, out_channels, device):
+    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, conv_hidden, out_channels, device, base_grid_channels=4):
         """Assemble the Tucker-only ablation model.
 
         Args:
@@ -107,6 +107,7 @@ class TuckerNika(nn.Module):
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
             ranks=complex_tucker_ranks,
+            base_grid_channels=base_grid_channels,
             device=device,
         ).to(device)
 
@@ -153,7 +154,7 @@ class TuckerNika(nn.Module):
 
 
 class WeirdNika(nn.Module):
-    def __init__(self, target_shape, k, complex_tucker_ranks, conv_hidden, grid_ranks, out_channels, device):
+    def __init__(self, target_shape, k, complex_tucker_ranks, conv_hidden, base_grid_channels, out_channels, device):
         """Assemble the feature-grid plus complex-Tucker ablation model.
 
         Args:
@@ -161,7 +162,7 @@ class WeirdNika(nn.Module):
             k: Spatial downsampling and pixel-shuffle upsampling factor.
             complex_tucker_ranks: Ranks for the FFT-domain Tucker branch.
             conv_hidden: Hidden width for the refinement CNN.
-            grid_ranks: Feature-grid resolution for the learned grid branch.
+            base_grid_channels: Channel width for the learned grid branch.
             out_channels: Number of image channels to predict.
             device: Device on which to allocate the module.
         """
@@ -171,13 +172,14 @@ class WeirdNika(nn.Module):
         self.internal_shape = [self.C, self.H, self.W, self.T]
         self.feature_grid = FeatureGrid(
             target_shape=self.internal_shape,
-            grid_res=grid_ranks,
+            grid_res=[base_grid_channels, self.H, self.W],
             device=device,
         ).to(device)
 
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
             ranks=complex_tucker_ranks,
+            base_grid_channels=base_grid_channels,
             device=device,
         ).to(device)
 
@@ -224,7 +226,7 @@ class WeirdNika(nn.Module):
 
 
 class NoConvNika(nn.Module):
-    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, out_channels, device):
+    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, base_grid_channels, out_channels, device):
         """Assemble the no-convolution ablation model.
 
         Args:
@@ -232,7 +234,7 @@ class NoConvNika(nn.Module):
             k: Spatial downsampling and pixel-shuffle upsampling factor.
             real_tucker_ranks: Ranks for the real-domain Tucker branch.
             complex_tucker_ranks: Ranks for the FFT-domain Tucker branch.
-            grid_ranks: Feature-grid resolution for the learned grid branch.
+            base_grid_channels: Channel width for the learned grid branch.
             out_channels: Number of image channels to predict.
             device: Device on which to allocate the module.
         """
@@ -242,7 +244,7 @@ class NoConvNika(nn.Module):
         self.internal_shape = [self.C, self.H, self.W, self.T]
         self.feature_grid = FeatureGrid(
             target_shape=self.internal_shape,
-            grid_res=grid_ranks,
+            grid_res=[base_grid_channels, self.H, self.W],
             device=device,
         ).to(device)
 
@@ -255,6 +257,7 @@ class NoConvNika(nn.Module):
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
             ranks=complex_tucker_ranks,
+            base_grid_channels=base_grid_channels,
             device=device,
         ).to(device)
 

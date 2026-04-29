@@ -73,20 +73,20 @@ def load_model(path: str, vid_shape: tuple, config: str, device: str) -> torch.n
     config_kwargs = REFERENCES[config]
 
     model_cls = NikaBlock
-    allowed_keys = {"grid_ranks", "real_tucker_ranks", "complex_tucker_ranks", "conv_hidden"}
+    allowed_keys = {"base_grid_channels", "real_tucker_ranks", "complex_tucker_ranks", "conv_hidden"}
 
     if config == "real-small":
         model_cls = RealNika
-        allowed_keys = {"grid_ranks", "real_tucker_ranks", "conv_hidden"}
+        allowed_keys = {"base_grid_channels", "real_tucker_ranks", "conv_hidden"}
     elif config == "tucker-small":
         model_cls = TuckerNika
-        allowed_keys = {"real_tucker_ranks", "complex_tucker_ranks", "conv_hidden"}
+        allowed_keys = {"base_grid_channels", "real_tucker_ranks", "complex_tucker_ranks", "conv_hidden"}
     elif config == "weird-nika":
         model_cls = WeirdNika
-        allowed_keys = {"grid_ranks", "complex_tucker_ranks", "conv_hidden"}
+        allowed_keys = {"base_grid_channels", "complex_tucker_ranks", "conv_hidden"}
     elif config == "noconv-nika":
         model_cls = NoConvNika
-        allowed_keys = {"grid_ranks", "real_tucker_ranks", "complex_tucker_ranks"}
+        allowed_keys = {"base_grid_channels", "real_tucker_ranks", "complex_tucker_ranks"}
 
     model_kwargs = _filter_kwargs(config_kwargs, allowed_keys)
     model = model_cls(
