@@ -1,3 +1,5 @@
+import argparse
+import re
 import os
 import time
 import math
@@ -30,90 +32,59 @@ class TuckerFactor(nn.Module):
         Perhaps someone can figure that out later, but the workaround seems easier atm.
         """
         super().__init__()
-        self.max_chunk_size = 500
         self.target_dim = target_dim
         self.rank = rank
         self.is_complex = is_complex
         self.device = device
 
-        def make_chunk(chunk_size):
-            if self.is_complex:
-                return nn.Parameter(torch.randn(chunk_size, rank, device=device) * base_mag), \
-                          nn.Parameter(torch.zeros(chunk_size, rank, device=device))  # real, imag
-            else:
-                return nn.Parameter(torch.randn(chunk_size, rank, device=device) * base_mag)
-        num_chunks = int((target_dim - 1) // self.max_chunk_size) + 1
-        self.chunked = False
-        if num_chunks > 1:
-            self.chunked = True
-
-        if self.chunked:
-            if self.is_complex:
-                self.real_chunks = nn.ParameterList()
-                self.imag_chunks = nn.ParameterList()
-            else:
-                self.chunks = nn.ParameterList()
-
-            for i in range(num_chunks):
-                start = i * self.max_chunk_size
-                end = min((i + 1) * self.max_chunk_size, target_dim)
-                chunk_size = end - start
-                if self.is_complex:
-                    real_param, imag_param = make_chunk(chunk_size)
-                    self.real_chunks.append(real_param)
-                    self.imag_chunks.append(imag_param)
-                else:
-                    param = make_chunk(chunk_size)
-                    self.chunks.append(param)
+        # Simplified: no chunking needed for current usage (dims <= 500)
+        if self.is_complex:
+            self.U_real = nn.Parameter(torch.randn(target_dim, rank, device=device) * base_mag)
+            self.U_imag = nn.Parameter(torch.zeros(target_dim, rank, device=device))
         else:
-            if self.is_complex:
-                self.U_real = nn.Parameter(torch.randn(target_dim, rank, device=device) * base_mag)
-                self.U_imag = nn.Parameter(torch.zeros(target_dim, rank, device=device))
-            else:
-                self.U = nn.Parameter(torch.randn(target_dim, rank, device=device) * base_mag)
+            self.U = nn.Parameter(torch.randn(target_dim, rank, device=device) * base_mag)
 
     def forward(self):
-        if self.chunked:
-            if self.is_complex:
-                real_parts = []
-                imag_parts = []
-                for r_chunk, i_chunk in zip(self.real_chunks, self.imag_chunks):
-                    real_parts.append(r_chunk)
-                    imag_parts.append(i_chunk)
-                U_real = torch.cat(real_parts, dim=0)
-                U_imag = torch.cat(imag_parts, dim=0)
-                U = torch.complex(U_real, U_imag)
+        def _col_norm(M, eps=1e-8):
+            if torch.is_complex(M):
+                norms_sq = (M.real**2 + M.imag**2).sum(dim=0, keepdim=True)
+                norms = torch.sqrt(norms_sq + eps)
             else:
-                parts = []
-                for chunk in self.chunks:
-                    parts.append(chunk)
-                U = torch.cat(parts, dim=0)
-        else:
-            if self.is_complex:
-                U = torch.complex(self.U_real, self.U_imag)
-            else:
-                U = self.U
-        return U
+                norms = M.norm(dim=0, keepdim=True) + eps
+            return M / norms
+        if self.is_complex:
+            return _col_norm(torch.complex(self.U_real, self.U_imag))
+        return _col_norm(self.U)
 
     def get(self, target):
         U = self.forward()
-        target = torch.as_tensor(target, device=U.device, dtype=torch.float32)
+        target = torch.as_tensor(target, device=U.device, dtype=torch.float32).view(-1)
+        # clamp to [0,1]
+        target = target.clamp(0.0, 1.0)
 
-        t_norm = 2.0 * target - 1.0  # [-1, 1]
-        t_norm = t_norm.view(1, -1, 1, 1)
-
-        grid = torch.zeros((1, t_norm.shape[1], 1, 2), device=U.device, dtype=t_norm.dtype)
-        grid[..., 1] = t_norm.squeeze(-1)  # y coord (H)
-        # x coord (W=1) stays 0
-
-        def _sample(inp):
-            inp_ = inp.transpose(0, 1).unsqueeze(0).unsqueeze(-1)  # [1, R, T, 1]
-            out = F.grid_sample(inp_, grid, mode="bilinear", align_corners=True, padding_mode="border")
-            return out.squeeze(0).squeeze(-1).transpose(0, 1)  # [B, R]
+        # continuous positions in [0, D-1]
+        D = self.target_dim
+        pos = target * (D - 1)
+        idx0 = pos.floor().long()
+        idx1 = (idx0 + 1).clamp(max=D - 1)
+        w = (pos - idx0.float()).unsqueeze(-1)  # [B,1]
 
         if torch.is_complex(U):
-            return torch.complex(_sample(U.real), _sample(U.imag))
-        return _sample(U)
+            real = U.real
+            imag = U.imag
+            s0_r = real[idx0]
+            s1_r = real[idx1]
+            s0_i = imag[idx0]
+            s1_i = imag[idx1]
+            out_r = (1.0 - w) * s0_r + w * s1_r
+            out_i = (1.0 - w) * s0_i + w * s1_i
+            return torch.complex(out_r, out_i)
+
+        # real case
+        s0 = U[idx0]
+        s1 = U[idx1]
+        out = (1.0 - w) * s0 + w * s1
+        return out
 
 
 class RealTucker(nn.Module):
@@ -130,16 +101,21 @@ class RealTucker(nn.Module):
         self.G = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
 
     def forward(self, t):
-        UT = self.UT.get(t)
-        UC = self.UC()
-        UH = self.UH()
-        UW = self.UW()
-        return tucker_construct(UT, UC, UH, UW, self.G).contiguous()
+        with record_function("RealTucker.forward"):
+            UT = self.UT.get(t)
+            UC = self.UC()
+            UH = self.UH()
+            UW = self.UW()
+            return tucker_construct(UT, UC, UH, UW, self.G).contiguous()
 
 
 class ComplexTucker(RealTucker):
 
-    def __init__(self, target_shape, ranks, device='cuda'):
+    def __init__(self, target_shape, ranks, grid_channels=None, device='cuda'):
+        """
+        `grid_channels`: optional int to specify number of channels for the complex feature grid.
+        If None, defaults to `self.C * 2` (legacy behavior).
+        """
         super().__init__(target_shape, ranks, device=device)
         half_W = (self.W // 2) + 1
         self.UH = TuckerFactor(self.H, self.rH, is_complex=True, device=device)
@@ -151,21 +127,22 @@ class ComplexTucker(RealTucker):
         self.G_real = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
         self.G_imag = nn.Parameter(torch.zeros(self.rT, self.rC, self.rH, self.rW, device=device))
 
-        self.feature_grid = FeatureGrid([self.C * 2, self.H, half_W, self.T], grid_res=[self.C * 2, self.H, half_W, 1], device=device)
+        self.feature_grid = FeatureGrid([self.C * 2, self.H, half_W, self.T], grid_res=grid_channels * 2, device=device)
 
     def forward(self, t):
-        UH = self.UH()
-        UW = self.UW()
-        UC = self.UC()
-        UT = self.UT.get(t)
-        G = torch.complex(self.G_real, self.G_imag)
-        construct = tucker_construct(UT, UC, UH, UW, G)
+        with record_function("ComplexTucker.forward"):
+            UH = self.UH()
+            UW = self.UW()
+            UC = self.UC()
+            UT = self.UT.get(t)
+            G = torch.complex(self.G_real, self.G_imag)
+            construct = tucker_construct(UT, UC, UH, UW, G)
 
-        grid = self.feature_grid(t)
-        complex_grid = torch.complex(*grid.chunk(2, dim=1))
-        construct = construct * complex_grid
-        real_tucker = torch.fft.irfft2(construct, norm='ortho').real
-        return real_tucker.contiguous()
+            grid = self.feature_grid(t)
+            complex_grid = torch.complex(*grid.chunk(2, dim=1))
+            construct = construct * complex_grid
+            real_tucker = torch.fft.irfft2(construct, norm='ortho').real
+            return real_tucker.contiguous()
 
 
 def grid_sample_base(H, W, device):
@@ -181,10 +158,12 @@ class FeatureGrid(nn.Module):
     def __init__(self, target_shape, grid_res, zero_init=False, device="cuda"):
         super().__init__()
         self.C, self.H, self.W, self.T = target_shape
-        self.grid_c = grid_res[0]
-        self.grid_h = grid_res[1]
-        self.grid_w = grid_res[2]
-        self.grid_t = grid_res[3]
+        # `grid_res` is channels-only (integer): number of grid channels.
+        # Spatial (H,W) uses full target (already downsampled by k upstream), temporal set to 1.
+        self.grid_c = int(grid_res)
+        self.grid_h = self.H
+        self.grid_w = self.W
+        self.grid_t = 1
 
         self.grid = nn.Parameter(torch.randn(self.grid_c, self.grid_h, self.grid_w, self.grid_t, device=device) * 1e-2)
         if self.grid_c != self.C:
@@ -203,29 +182,15 @@ class FeatureGrid(nn.Module):
         return self.grid.permute(0, 3, 1, 2).unsqueeze(0)
 
     def forward(self, t):
-        device = self.grid.device
-        B = t.shape[0]
+        with record_function("FeatureGrid.forward"):
+            B = t.shape[0]
+            # grid: [grid_c, H, W, 1] -> remove last dim and expand over batch
+            grid_spatial = self.grid.squeeze(-1)  # [grid_c, H, W]
+            result = grid_spatial.unsqueeze(0).expand(B, -1, -1, -1)  # [B, grid_c, H, W]
 
-        sample_grid3 = torch.empty((B, self.H, self.W, 3), device=device, dtype=self._xy_base.dtype)
-        sample_grid3[..., :2] = self._xy_base
-        sample_grid3[..., 2] = (2.0 * t - 1.0).view(B, 1, 1)
-
-        sample_grid3 = sample_grid3.unsqueeze(1)  # [B,1,H,W,3]
-
-        grid_5d = self._5d_grid().expand(B, -1, -1, -1, -1)
-
-        sampled = F.grid_sample(
-            grid_5d,               # [B, C, T_g, H_g, W_g]
-            sample_grid3,           # [B, 1, H_out, W_out, 3]
-            mode='bilinear',
-            align_corners=False,
-            padding_mode='border',
-        )  # → [B, C, 1, H_out, W_out]
-
-        result = sampled.squeeze(2)
-        if hasattr(self, 'channel_proj'):
-            result = self.channel_proj(result.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        return result.contiguous()
+            if hasattr(self, 'channel_proj'):
+                result = self.channel_proj(result.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            return result.contiguous()
 
 
 def tucker_construct(UT, UC, UH, UW, G):
@@ -235,50 +200,54 @@ def tucker_construct(UT, UC, UH, UW, G):
     UW = UW.contiguous()
     G = G.contiguous()
 
-    def _col_norm(M, eps=1e-8):
-        if torch.is_complex(M):
-            norms_sq = (M.real**2 + M.imag**2).sum(dim=0, keepdim=True)
-            norms = torch.sqrt(norms_sq + eps)
-        else:
-            norms = M.norm(dim=0, keepdim=True) + eps
-        return M / norms
-
-    UH = _col_norm(UH)
-    UW = _col_norm(UW)
-    UC = _col_norm(UC)
-    UT = _col_norm(UT)
-
     X = torch.einsum('ijkl,ti,cj,hk,wl->tchw', G, UT, UC, UH, UW)
     return X
+
+
+class ConvNeXtBlock(nn.Module):
+    def __init__(self, dim, device='cuda'):
+        super().__init__()
+        self.dw_conv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim).to(device)
+        self.norm = nn.LayerNorm(dim, eps=1e-6).to(device)
+        self.pw_conv1 = nn.Linear(dim, 4 * dim).to(device)
+        self.act = nn.GELU()
+        self.pw_conv2 = nn.Linear(4 * dim, dim).to(device)
+
+        nn.init.zeros_(self.pw_conv2.weight)
+        nn.init.zeros_(self.pw_conv2.bias)
+
+    def forward(self, x):
+        identity = x
+        x = self.dw_conv(x)
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        x = self.pw_conv1(x)
+        x = self.act(x)
+        x = self.pw_conv2(x)
+        x = x.permute(0, 3, 1, 2)
+        return identity + x
 
 
 class BasicUpres(nn.Module):
     def __init__(self, in_channels, out_channels, hidden, k, encoding_len=64, device='cuda'):
         super().__init__()
-        half_k = k // 2
         self.k = k
 
-        self.upres = nn.Sequential(
-            nn.Conv2d(in_channels, hidden, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden),
-            nn.GELU(),
-            nn.Conv2d(hidden, hidden, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden, out_channels * (k ** 2), kernel_size=1),
-            nn.PixelShuffle(upscale_factor=k),
-        ).to(device)
+        self.project_in = nn.Conv2d(in_channels, hidden, kernel_size=1).to(device)
+        self.convnext = ConvNeXtBlock(hidden, device=device)
+        self.project_out = nn.Conv2d(hidden, out_channels * (k ** 2), kernel_size=1).to(device)
+        self.pixel_shuffle = nn.PixelShuffle(upscale_factor=k)
 
-        #kaiming init
-        for m in self.upres.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        for m in [self.project_in, self.project_out]:
+            nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        base = self.upres(x)
-        return base
+        x = self.project_in(x)
+        x = self.convnext(x)
+        x = self.project_out(x)
+        return self.pixel_shuffle(x)
 
 
 class ConvOperator(nn.Module):
@@ -321,12 +290,6 @@ class ConvOperator(nn.Module):
         nn.init.zeros_(self.t_modulator[-1].bias)
 
     def forward(self, x, t):
-        if x.all() == 0:
-            return torch.zeros(
-                (x.shape[0], self.out_channels, x.shape[2], x.shape[3]),
-                device=self.device,
-                dtype=x.dtype,
-            )
         initial = self.operator_head(x)
         time_emb = self.encoding(t)
         modulation = self.t_modulator(time_emb)
@@ -339,39 +302,44 @@ class ConvOperator(nn.Module):
 
 
 class NikaBlock(nn.Module):
-    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, conv_hidden, out_channels, device):
+    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, conv_hidden, out_channels, operator_steps, op_hdim, device):
         super().__init__()
-        self.C, self.H, self.W, self.T = target_shape
+        self.C, self.H, self.W, T = target_shape
+        self.orig_T = T
+        self.T = T + (operator_steps * 2)  # Virtual padding
         self.H = int(self.H // k); self.W = int(self.W // k)
-        self.internal_shape = [self.C, self.H, self.W, self.T]
+        self.internal_shape = [self.C, self.H, self.W, self.T]  # extra time steps for operator predictions
         self.dT = 1.0 / (self.T - 1)
         self.real_tucker = RealTucker(
             target_shape=self.internal_shape,
             ranks=real_tucker_ranks,
             device=device,
         )
-        self.real_tucker = torch.compile(self.real_tucker)
+        if os.environ.get('NIKA_USE_TORCH_COMPILE', '1') == '1':
+            self.real_tucker = torch.compile(self.real_tucker)
 
         self.grid_features = FeatureGrid(
             target_shape=self.internal_shape,
             grid_res=grid_ranks,
             device=device,
         )
-        self.grid_features = torch.compile(self.grid_features)
+        if os.environ.get('NIKA_USE_TORCH_COMPILE', '1') == '1':
+            self.grid_features = torch.compile(self.grid_features)
 
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
             ranks=complex_tucker_ranks,
+            grid_channels=grid_ranks,
             device=device,
         )
 
         self.n_heads = 3
 
         self.groupnorm = nn.GroupNorm(num_groups=self.n_heads, num_channels=self.n_heads * self.C).to(device)
-        self.groupnorm = torch.compile(self.groupnorm)
+        if os.environ.get('NIKA_USE_TORCH_COMPILE', '1') == '1':
+            self.groupnorm = torch.compile(self.groupnorm)
 
-        op_hdim = 64
-        self.operator_steps = 2
+        self.operator_steps = operator_steps
 
         self.forward_operators = nn.ModuleList()
         self.backward_operators = nn.ModuleList()
@@ -388,8 +356,12 @@ class NikaBlock(nn.Module):
                 h_dim = op_hdim,
                 device = device,
             )
-            self.forward_operators.append(torch.compile(fwd))
-            self.backward_operators.append(torch.compile(bwd))
+            if os.environ.get('NIKA_USE_TORCH_COMPILE', '1') == '1':
+                self.forward_operators.append(torch.compile(fwd))
+                self.backward_operators.append(torch.compile(bwd))
+            else:
+                self.forward_operators.append(fwd)
+                self.backward_operators.append(bwd)
 
         self.upres = BasicUpres(
             in_channels = self.n_heads * self.C,
@@ -398,7 +370,8 @@ class NikaBlock(nn.Module):
             k = k,    
             device = device,
         )
-        self.upres = torch.compile(self.upres)
+        if os.environ.get('NIKA_USE_TORCH_COMPILE', '1') == '1':
+            self.upres = torch.compile(self.upres)
 
         self.log_stats()
 
@@ -422,6 +395,7 @@ class NikaBlock(nn.Module):
         if type(norm_t) is not torch.Tensor:
             norm_t = torch.tensor([norm_t], device=self.grid_features.grid.device, dtype=torch.float32)
 
+        norm_t = (norm_t * (self.orig_T - 1) + float(self.operator_steps)) * self.dT
         if not hasattr(self, "_zero_base"):
             self.register_buffer(
             "_zero_base",
@@ -430,58 +404,68 @@ class NikaBlock(nn.Module):
         )
 
         zero_base = self._zero_base.expand(norm_t.shape[0], -1, -1, -1)
-        curr_real_tucker = self.real_tucker(norm_t) if not zero_real_tucker else zero_base
-        curr_real_grid = self.grid_features(norm_t) if not zero_feature_grid else zero_base
-        curr_complex_tucker = self.complex_tucker(norm_t) if not zero_complex_tucker else zero_base
 
-        current_base = torch.cat([curr_real_grid, curr_real_tucker, curr_complex_tucker], dim=1)
-        current_input = self.groupnorm(current_base)
+        B = norm_t.shape[0]
+        S = int(self.operator_steps)
 
-        operator_residual = torch.zeros_like(current_input)
-        for i in range(self.operator_steps):
-            step_len = (i + 1) * self.dT
-            mask_prev = (norm_t >= step_len)
-            norm_t_prev = (norm_t[mask_prev] - step_len) if mask_prev.any() else None
-            mask_next = (norm_t <= (1 - step_len))
-            norm_t_next = (norm_t[mask_next] + step_len) if mask_next.any() else None
+        # Precompute all needed shifted times: offsets = [-S..S] * dT
+        offsets = (torch.arange(-S, S + 1, device=norm_t.device, dtype=norm_t.dtype) * self.dT).unsqueeze(0)  # [1, 2S+1]
+        times = (norm_t.unsqueeze(1) + offsets).clamp(0.0, 1.0)  # [B, 2S+1]
+        times_flat = times.reshape(-1)
 
-            prev_real_tucker, next_real_tucker = zero_base, zero_base
-            prev_complex_tucker, next_complex_tucker = zero_base, zero_base
-            prev_grid, next_grid = zero_base, zero_base
-
+        # Batch-evaluate the three heavy modules once over all shifted times
+        with record_function("NikaBlock.evaluate_tucker_components"):
             if not zero_real_tucker:
-                prev_real_tucker = self.real_tucker(norm_t_prev) if mask_prev.any() else zero_base
-                next_real_tucker = self.real_tucker(norm_t_next) if mask_next.any() else zero_base
-            
+                real_all = self.real_tucker(times_flat)  # [B*(2S+1), C, H, W]
+                real_all = real_all.view(B, 2 * S + 1, self.C, self.H, self.W)
+            else:
+                real_all = zero_base.unsqueeze(1).expand(B, 2 * S + 1, -1, -1, -1)
+
             if not zero_feature_grid:
-                prev_grid = self.grid_features(norm_t_prev) if mask_prev.any() else zero_base
-                next_grid = self.grid_features(norm_t_next) if mask_next.any() else zero_base
+                grid_all = self.grid_features(times_flat)
+                grid_all = grid_all.view(B, 2 * S + 1, self.C, self.H, self.W)
+            else:
+                grid_all = zero_base.unsqueeze(1).expand(B, 2 * S + 1, -1, -1, -1)
 
             if not zero_complex_tucker:
-                prev_complex_tucker = self.complex_tucker(norm_t_prev) if mask_prev.any() else zero_base
-                next_complex_tucker = self.complex_tucker(norm_t_next) if mask_next.any() else zero_base
+                complex_all = self.complex_tucker(times_flat)
+                complex_all = complex_all.view(B, 2 * S + 1, self.C, self.H, self.W)
+            else:
+                complex_all = zero_base.unsqueeze(1).expand(B, 2 * S + 1, -1, -1, -1)
 
-            prev_base = torch.cat([prev_grid, prev_real_tucker, prev_complex_tucker], dim=1)
-            prev_base = self.groupnorm(prev_base)
+            # Concatenate channels for GroupNorm, apply GN in one batch, then reshape
+            total_c = (grid_all.shape[2] + real_all.shape[2] + complex_all.shape[2])
+            base_all = torch.cat([grid_all, real_all, complex_all], dim=2)  # [B, 2S+1, C_total, H, W]
+            base_all_flat = base_all.view(B * (2 * S + 1), total_c, self.H, self.W)
+            base_all_gnorm = self.groupnorm(base_all_flat)
+            base_all_gnorm = base_all_gnorm.view(B, 2 * S + 1, total_c, self.H, self.W)
 
-            prev_frames = torch.zeros_like(current_input)
-            prev_frames[mask_prev] = prev_base
-            forward_operator = self.forward_operators[i]
-            if mask_prev.any():
-                forward_prediction = forward_operator(torch.cat([prev_frames, current_input], dim=1), norm_t_prev)
+        # center slice is the current input
+        center_idx = S
+        current_input = base_all_gnorm[:, center_idx]
+
+        operator_residual = torch.zeros_like(current_input)
+        with record_function("NikaBlock.operator_loop"):
+            for i in range(S):
+                prev_idx = center_idx - (i + 1)
+                next_idx = center_idx + (i + 1)
+
+                prev_base = base_all_gnorm[:, prev_idx]
+                next_base = base_all_gnorm[:, next_idx]
+
+                forward_operator = self.forward_operators[i]
+                forward_input = torch.cat([prev_base, current_input], dim=1)
+                forward_prediction = forward_operator(forward_input, times[:, prev_idx])
                 operator_residual += forward_prediction
 
-            next_base = torch.cat([next_grid, next_real_tucker, next_complex_tucker], dim=1)
-            next_base = self.groupnorm(next_base)
-            next_frames = torch.zeros_like(current_input)
-            next_frames[mask_next] = next_base
-            backward_operator = self.backward_operators[i]
-            if mask_next.any():
-                backward_prediction = backward_operator(torch.cat([current_input, next_frames], dim=1), norm_t_next)
+                backward_operator = self.backward_operators[i]
+                backward_input = torch.cat([current_input, next_base], dim=1)
+                backward_prediction = backward_operator(backward_input, times[:, next_idx])
                 operator_residual += backward_prediction
 
         aggregated = current_input + operator_residual
-        refined = self.upres(aggregated)
+        with record_function("NikaBlock.upres"):
+            refined = self.upres(aggregated)
 
         if return_operators:
             refined_forward = self.upres(forward_prediction)
@@ -489,27 +473,15 @@ class NikaBlock(nn.Module):
             return refined, refined_forward, refined_backward
         return refined
 
-    def test_images(self, output_dir):
-        # self.eval()
-        with torch.no_grad():
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir, exist_ok=True)
-            rand_vals = torch.linspace(0, self.T - 1, steps=10, dtype=torch.int64, device=self.grid_features.grid.device)
-            torch.cuda.synchronize()
-            start_time = time.time()
-            imgs = self.forward(rand_vals, rand_vals)
-            torch.cuda.synchronize()
-            average_frame_time = (time.time() - start_time) / rand_vals.shape[0]
-            print(f"Average inference time per frame: {average_frame_time:.5f}s")
-            print(f"FPS: {1.0 / average_frame_time:.2f}")
-            for i in range(imgs.shape[0]):
-                img = imgs[i].clamp(0.0, 1.0)
-                save_image(img, f"{output_dir}/frame_{i:04d}.png")
 
-
-def feature_test(vid, name, config, device):
-    batch_size = 6
+def feature_test(vid, dataset_name, model_name, config, device, batch_size=32):
+    base_name = os.path.basename(dataset_name)
     model_kwargs = REFERENCES[config]
+    # copy and allow dataset-specific overrides
+    model_kwargs = dict(model_kwargs)
+    # double feature-grid channels for high-res 'bunny' dataset
+    if base_name == 'bunny':
+        model_kwargs['grid_ranks'] = model_kwargs['grid_ranks'] * 2
     model = NikaBlock(
         target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
         k=4,
@@ -518,9 +490,6 @@ def feature_test(vid, name, config, device):
         device=device,
     )
 
-    # create optimizer with two parameter groups:
-    #  - basis_params: the two tuckers + the feature grid (we'll decay their lr)
-    #  - rest_params: all remaining parameters (keep their lr constant)
     base_lr = 1e-2
     basis_params = list(model.real_tucker.parameters()) + list(model.complex_tucker.parameters()) + list(model.grid_features.parameters())
     basis_ids = set(map(id, basis_params))
@@ -530,67 +499,119 @@ def feature_test(vid, name, config, device):
         {"params": rest_params, "lr": base_lr},
     ], lr=base_lr)
 
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt,
+        mode='max',
+        factor=0.5,
+        patience=40,
+        threshold = 0.015,
+        threshold_mode='abs',
+        cooldown=20,
+        min_lr=1e-3,
+    )
+
     best_psnr = float('-inf')
     best_epoch = -1
+    current_batch_size = batch_size
+    epoch = 0
 
-    for epoch in range(2000):
-        opt.zero_grad(set_to_none=True)
-        loss = 0.0
-        start_time = time.time()
-        num_batches = (vid.shape[0] + batch_size - 1) // batch_size
-        for t in range(num_batches):
-            min_t = t * batch_size
-            max_t = min((t + 1) * batch_size, vid.shape[0])
-            batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
-            t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
-            norm_t_batch = t_batch.float() / (vid.shape[0] - 1)
-            prediction = model(norm_t_batch)
-            mse = F.mse_loss(prediction, batch_gt)
-            psnr = -10.0 * torch.log10(mse + 1e-8)
-            frame_loss = (-psnr).mean() / num_batches
-            frame_loss.backward()
-            loss += frame_loss
-        average_frame_time = (time.time() - start_time) / vid.shape[0]
-        epoch_psnr = -loss.item()
-        print(f"Epoch {epoch} loss: {loss.item():.4f}, time: {average_frame_time:.5f}s, PSNR: {epoch_psnr:.2f}")
-
-        # schedule: linearly anneal basis lr from base_lr -> 0 over epochs [500, 1500]
-        if epoch < 500:
-            new_basis_lr = base_lr
-        elif epoch <= 1500:
-            frac = (epoch - 500) / float(1500 - 500)
-            new_basis_lr = base_lr * (1.0 - frac)
-        else:
-            new_basis_lr = 0.0
-        # our first param_group is the basis group
+    while epoch < 2000:
         try:
-            opt.param_groups[0]["lr"] = new_basis_lr
-        except Exception:
-            pass
+            opt.zero_grad(set_to_none=True)
+            loss = 0.0
+            start_time = time.time()
+            num_batches = (vid.shape[0] + current_batch_size - 1) // current_batch_size
+            for t in range(num_batches):
+                min_t = t * current_batch_size
+                max_t = min((t + 1) * current_batch_size, vid.shape[0])
+                batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
+                t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
+                norm_t_batch = t_batch.float() / (vid.shape[0] - 1)
+                prediction = model(norm_t_batch)
+                mse = F.mse_loss(prediction, batch_gt)
+                psnr = -10.0 * torch.log10(mse + 1e-8)
 
-        if epoch_psnr > best_psnr and (epoch - best_epoch >= 10 or best_epoch == -1):
-            best_psnr = epoch_psnr
-            best_epoch = epoch
-            model_path = f"models/{config}-{name}-epoch{epoch}-psnr{best_psnr:.2f}.torch"
-            torch.save(model.state_dict(), model_path)
-            os.sync()
-            print(f"New best model saved at epoch {epoch} with PSNR: {best_psnr:.2f}")
+                frame_loss = (-psnr) * (batch_gt.shape[0] / vid.shape[0])  # weight by number of frames in batch
+                frame_loss.backward()
+                loss += frame_loss
+            average_frame_time = (time.time() - start_time) / vid.shape[0]
+            epoch_psnr = -loss.item()
+            print(f"[{dataset_name}] Epoch {epoch} loss: {loss.item():.4f}, time: {average_frame_time:.5f}s, PSNR: {epoch_psnr:.2f}")
 
-        opt.step()
+            if epoch_psnr > best_psnr and (epoch - best_epoch >= 10 or best_epoch == -1):
+                best_psnr = epoch_psnr
+                best_epoch = epoch
+                os.makedirs("models", exist_ok=True)
+                model_path = f"models/{config}-{model_name}-epoch{epoch}-psnr{best_psnr:.2f}.torch"
+                torch.save(model.state_dict(), model_path)
+                os.sync()
+                print(f"[{dataset_name}] New best model saved at epoch {epoch} with PSNR: {best_psnr:.2f}")
 
-        if epoch % 25 == 0:
-            print(f"Epoch {epoch}: Tucker PSNR: {epoch_psnr:.2f}")
-            model.test_images("out_feature_test")
+            opt.step()
+            scheduler.step(epoch_psnr)
+
+            if epoch % 25 == 0:
+                print(f"[{dataset_name}] Epoch {epoch}: Tucker PSNR: {epoch_psnr:.2f}")
+
+            epoch += 1
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower():
+                torch.cuda.empty_cache()
+                if current_batch_size <= 1:
+                    raise
+                current_batch_size = max(1, current_batch_size // 2)
+                print(f"OOM during epoch {epoch}; reducing batch_size to {current_batch_size} and retrying.")
+                continue
+            raise
 
     print(f"Best PSNR achieved: {best_psnr:.2f} at epoch {best_epoch}")
 
 
+def run_all_feature_tests(names, basedir, config, device, batch_size=32):
+    for dataset_name in names:
+        print(f"\n=== Starting dataset: {dataset_name} ===")
+        vid = load_video_frames(f"{basedir}/{dataset_name}", device, dtype=torch.uint8, normalize=False)
+        torch.manual_seed(42)
+        feature_test(
+            vid,
+            dataset_name=dataset_name,
+            model_name=os.path.basename(dataset_name),
+            config=config,
+            device=device,
+            batch_size=batch_size,
+        )
+
+
 if __name__ == "__main__":
-    device = "cuda:0"
-    name = "shake"
+    parser = argparse.ArgumentParser(description="Run Nika feature test")
+    parser.add_argument("--basedir", default="static/benchmarks", help="Base video directory")
+    parser.add_argument("--name", default="bunny", help="Single video name")
+    parser.add_argument("--names", help="Comma-separated dataset names to run serially")
+    parser.add_argument("--config", default="small", help="Config name from configs.REFERENCES")
+    parser.add_argument("--device", default="cuda:1", help="Device to run on, e.g. cuda:0 or 0")
+    parser.add_argument("--batch_size", type=int, default=32, help="Initial training batch size")
+    args = parser.parse_args()
+
+    device = args.device
+    if isinstance(device, str):
+        if re.fullmatch(r"\d+", device):
+            device = f"cuda:{device}"
+        elif re.fullmatch(r"cuda\d+", device):
+            device = device.replace('cuda', 'cuda:')
+
+    names = [args.name]
+    if args.names:
+        names = [n.strip() for n in args.names.split(",") if n.strip()]
+
     torch.manual_seed(42)
-    vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    vid = load_video_frames(f"{args.basedir}/{dataset_name}", device, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    feature_test(vid, name, f"large", device=device)
+    feature_test(
+        vid,
+        dataset_name=args.name,
+        model_name=args.name.rpartition("/")[-1],
+        config=args.config,
+        device=device
+    )

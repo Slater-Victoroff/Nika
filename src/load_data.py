@@ -7,7 +7,6 @@ def load_video_frames(
     dir_path,
     device="cuda",
     dtype=torch.float32,
-    max_frames=100,
     normalize=True,
 
 ):
@@ -15,10 +14,8 @@ def load_video_frames(
     all_paths = sorted(glob.glob(f"{dir_path}/*.png"))
     if not all_paths:
         raise RuntimeError(f"No frames found in {dir_path}")
-    if len(all_paths) <= max_frames:
-        paths = all_paths
-    else:
-        paths = all_paths[:max_frames]
+    # Always load all available frames (no slicing by max_frames)
+    paths = all_paths
     first = iio.imread(paths[0], plugin="pillow")
     H, W = first.shape[:2]
 
