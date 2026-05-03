@@ -1,5 +1,6 @@
 import glob
 import math
+import copy
 import os
 import re
 import time
@@ -19,7 +20,7 @@ except Exception:
     FlopCounterMode = None
 
 
-def get_best_model(model_dir, vid_shape, vid_name, config, device):
+def get_best_model(model_dir, vid_shape, vid_name, config, device, compile_ops=False):
     model_vid = os.path.basename(vid_name)
     candidates = glob.glob(f"{model_dir}/{config}-{model_vid}-*.torch")
 
@@ -60,6 +61,7 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
         out_channels=3,
         device=device,
         num_segments=num_segments,
+        compile_ops=compile_ops,
     )
 
     state_dict = torch.load(model_path, map_location=device)
@@ -79,27 +81,36 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
 
 
 def compute_macs(model, device):
+    if FlopCounterMode is None:
+        return None
+
     sample_model = model
     if hasattr(model, 'models') and len(model.models) > 0:
         sample_model = model.models[0]
-    if hasattr(sample_model, '_orig_mod'):
+    while hasattr(sample_model, '_orig_mod'):
         sample_model = sample_model._orig_mod
 
     sample_t = torch.tensor([0.0], device=device, dtype=torch.float32)
-    flops = FlopCounterMode(sample_model, (sample_t,))
-    return flops.total()
+    try:
+        flops = FlopCounterMode(sample_model, (sample_t,))
+        return flops.total()
+    except Exception as exc:
+        print(f"Warning: could not compute MACs: {exc}")
+        return None
 
 
-def warmup_model(model, num_frames, device, batch_size=8):
+def warmup_model(model, num_frames, device, batch_size=8, repeats=10):
     model.eval()
-    if 'cuda' in device:
+    use_cuda = 'cuda' in device
+    if use_cuda:
         torch.cuda.synchronize(device)
     with torch.no_grad():
-        for _ in range(10):
-            n = min(batch_size, num_frames)
-            norm_t = torch.arange(n, device=device, dtype=torch.float32) / max(num_frames - 1, 1)
-            _ = model(norm_t)
-    if 'cuda' in device:
+        for _ in range(repeats):
+            for start_idx in range(0, num_frames, batch_size):
+                end_idx = min(num_frames, start_idx + batch_size)
+                norm_t = torch.arange(start_idx, end_idx, device=device, dtype=torch.float32) / max(num_frames - 1, 1)
+                _ = model(norm_t)
+    if use_cuda:
         torch.cuda.synchronize(device)
 
 
@@ -107,9 +118,6 @@ def measure_decode_fps(model, num_frames, device, batch_size=8, repeats=20):
     model.eval()
     times = torch.linspace(0.0, 1.0, steps=num_frames, device=device, dtype=torch.float32)
     use_cuda = 'cuda' in device
-    if use_cuda:
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
 
     with torch.no_grad():
         for _ in range(10):
@@ -130,7 +138,8 @@ def measure_decode_fps(model, num_frames, device, batch_size=8, repeats=20):
     if use_cuda:
         torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start
-    return float(num_frames * repeats) / elapsed
+    total_frames = float(num_frames * repeats)
+    return total_frames / elapsed if elapsed > 0 else float('inf')
 
 
 def measure_psnr(model, vid, device, batch_size=8, debug_psnr=False):
@@ -160,49 +169,63 @@ def measure_psnr(model, vid, device, batch_size=8, debug_psnr=False):
     return float(avg_psnr)
 
 
-def measure_encode_fps(model, vid, device, steps=5, n_frames=20):
-    model.train()
+def measure_encode_fps(model, vid, device, steps=5, n_frames=None, batch_size=8):
+    try:
+        encode_model = copy.deepcopy(model)
+    except Exception:
+        encode_model = copy.deepcopy(getattr(model, '_orig_mod', model))
+
+    encode_model.train()
+    if n_frames is None:
+        n_frames = vid.shape[0]
     n_frames = min(n_frames, vid.shape[0])
-    idx = torch.arange(n_frames, device=device)
-    norm_t = idx.float() / max(vid.shape[0] - 1, 1)
-    target = vid[idx].to(torch.float32) / 255.0
-    opt = SOAP(model.parameters(), lr=1e-2)
+    batch_size = min(batch_size, n_frames)
+    batch_ranges = [(i, min(n_frames, i + batch_size)) for i in range(0, n_frames, batch_size)]
+    opt = SOAP(encode_model.parameters(), lr=1e-2)
 
     use_cuda = 'cuda' in device
     if use_cuda:
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-
-    if use_cuda:
         torch.cuda.synchronize(device)
-
-    for _ in range(5):
-        opt.zero_grad(set_to_none=True)
-        pred = model(norm_t)
-        loss = F.mse_loss(pred, target)
-        loss.backward()
-        opt.step()
-
-    if use_cuda:
-        torch.cuda.synchronize(device)
-        start_event.record()
     else:
-        start_time = time.perf_counter()
+        pass
+
+    norm_t_batches = []
+    target_batches = []
+    use_target_device = vid.device == torch.device(device) if isinstance(device, str) else vid.device == device
+    for start_idx, end_idx in batch_ranges:
+        idx = torch.arange(start_idx, end_idx, device=device, dtype=torch.float32)
+        norm_t_batches.append(idx / max(vid.shape[0] - 1, 1))
+        target = vid[start_idx:end_idx].float() / 255.0
+        if not use_target_device:
+            target = target.to(device)
+        target_batches.append(target)
+
+    warmup_steps = min(2, steps)
+    for _ in range(warmup_steps):
+        for norm_t, target in zip(norm_t_batches, target_batches):
+            opt.zero_grad(set_to_none=True)
+            pred = encode_model(norm_t)
+            loss = F.mse_loss(pred, target)
+            loss.backward()
+            opt.step()
+
+    if use_cuda:
+        torch.cuda.synchronize(device)
+    start = time.perf_counter()
 
     for _ in range(steps):
-        opt.zero_grad(set_to_none=True)
-        pred = model(norm_t)
-        loss = F.mse_loss(pred, target)
-        loss.backward()
-        opt.step()
+        for norm_t, target in zip(norm_t_batches, target_batches):
+            opt.zero_grad(set_to_none=True)
+            pred = encode_model(norm_t)
+            loss = F.mse_loss(pred, target)
+            loss.backward()
+            opt.step()
 
     if use_cuda:
-        end_event.record()
         torch.cuda.synchronize(device)
-        elapsed = start_event.elapsed_time(end_event) * 1e-3
-    else:
-        elapsed = time.perf_counter() - start_time
-    return float((n_frames * steps) / elapsed) if elapsed > 0 else float('inf')
+    elapsed = time.perf_counter() - start
+    total_frames = float(n_frames * steps)
+    return total_frames / elapsed if elapsed > 0 else float('inf')
 
 
 def main():
@@ -213,6 +236,8 @@ def main():
     parser.add_argument("--device", default="cuda:0", help="Device to run on, e.g. cuda:0 or cpu")
     parser.add_argument("--model_dir", default="models/ref_models/large", help="Directory containing reference model checkpoints")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for decode/PSNR measurement")
+    parser.add_argument("--compile_ops", action="store_true", help="Compile Nika internal operator modules for inference")
+    parser.add_argument("--compile_model", action="store_true", help="Compile the whole loaded MosaicNika model for inference")
     parser.add_argument("--debug_psnr", action="store_true", help="Print per-frame PSNR values during decode evaluation")
     args = parser.parse_args()
 
@@ -228,20 +253,22 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
 
     vid = load_video_frames(f"{args.basedir}/{args.name}", device, dtype=torch.uint8, normalize=False)
-    model = get_best_model(args.model_dir, vid.shape, args.name, args.config, device)
+    compile_ops = args.compile_ops and not args.compile_model
+    model = get_best_model(args.model_dir, vid.shape, args.name, args.config, device, compile_ops=compile_ops)
+
+    if args.compile_model:
+        try:
+            model = torch.compile(model)
+            print("Compiled whole model successfully.")
+        except Exception as exc:
+            print(f"Warning: torch.compile failed for whole model: {exc}")
 
     macs = compute_macs(model, device)
-
-    try:
-        model = torch.compile(model)
-        print("Compiled model successfully.")
-    except Exception as exc:
-        print(f"Warning: torch.compile failed, running uncompiled model: {exc}")
 
     warmup_model(model, vid.shape[0], device, batch_size=args.batch_size)
     decode_fps = measure_decode_fps(model, vid.shape[0], device, batch_size=args.batch_size)
     psnr = measure_psnr(model, vid, device, batch_size=args.batch_size, debug_psnr=args.debug_psnr)
-    encode_fps = measure_encode_fps(model, vid, device)
+    encode_fps = measure_encode_fps(model, vid, device, batch_size=args.batch_size)
 
     print(f"Decode FPS: {decode_fps:.2f}")
     print(f"Encode FPS: {encode_fps:.2f}")

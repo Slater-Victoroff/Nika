@@ -302,7 +302,7 @@ class ConvOperator(nn.Module):
 
 
 class NikaBlock(nn.Module):
-    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, conv_hidden, out_channels, operator_steps, op_hdim, device):
+    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, conv_hidden, out_channels, operator_steps, op_hdim, device, use_compile=False):
         super().__init__()
         self.C, self.H, self.W, T = target_shape
         self.orig_T = T
@@ -315,12 +315,14 @@ class NikaBlock(nn.Module):
             ranks=real_tucker_ranks,
             device=device,
         )
+        self.real_tucker = torch.compile(self.real_tucker) if use_compile else self.real_tucker
 
         self.grid_features = FeatureGrid(
             target_shape=self.internal_shape,
             grid_res=grid_ranks,
             device=device,
         )
+        self.grid_features = torch.compile(self.grid_features) if use_compile else self.grid_features
 
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
@@ -330,8 +332,10 @@ class NikaBlock(nn.Module):
         )
 
         self.n_heads = 3
+        self.use_compile = bool(use_compile)
 
         self.groupnorm = nn.GroupNorm(num_groups=self.n_heads, num_channels=self.n_heads * self.C).to(device)
+        self.groupnorm = torch.compile(self.groupnorm) if self.use_compile else self.groupnorm
         self.operator_steps = operator_steps
 
         self.forward_operators = nn.ModuleList()
@@ -349,6 +353,9 @@ class NikaBlock(nn.Module):
                 h_dim = op_hdim,
                 device = device,
             )
+            if self.use_compile:
+                fwd = torch.compile(fwd)
+                bwd = torch.compile(bwd)
             self.forward_operators.append(fwd)
             self.backward_operators.append(bwd)
 
@@ -359,6 +366,8 @@ class NikaBlock(nn.Module):
             k = k,    
             device = device,
         )
+        if self.use_compile:
+            self.upres = torch.compile(self.upres)
 
         self.log_stats()
 
@@ -476,7 +485,7 @@ def split_segments(total_frames, num_segments):
 
 
 class MosaicNika(nn.Module):
-    def __init__(self, target_shape, k, model_kwargs, out_channels, device='cuda', num_segments=1):
+    def __init__(self, target_shape, k, model_kwargs, out_channels, device='cuda', num_segments=1, compile_ops=False):
         super().__init__()
         self.num_segments = max(1, num_segments)
         self.total_frames = target_shape[3]
@@ -492,6 +501,7 @@ class MosaicNika(nn.Module):
                 **model_kwargs,
                 out_channels=out_channels,
                 device=device,
+                use_compile=compile_ops,
             )
             self.models.append(model)
 
