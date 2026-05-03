@@ -79,9 +79,6 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
 
 
 def compute_macs(model, device):
-    if FlopCounterMode is None:
-        return None
-
     sample_model = model
     if hasattr(model, 'models') and len(model.models) > 0:
         sample_model = model.models[0]
@@ -89,12 +86,8 @@ def compute_macs(model, device):
         sample_model = sample_model._orig_mod
 
     sample_t = torch.tensor([0.0], device=device, dtype=torch.float32)
-    try:
-        flops = FlopCounterMode(sample_model, (sample_t,))
-        return flops.total()
-    except Exception as exc:
-        print(f"Warning: could not compute MACs: {exc}")
-        return None
+    flops = FlopCounterMode(sample_model, (sample_t,))
+    return flops.total()
 
 
 def warmup_model(model, num_frames, device, batch_size=8):
@@ -110,15 +103,42 @@ def warmup_model(model, num_frames, device, batch_size=8):
         torch.cuda.synchronize(device)
 
 
-def measure_decode_and_psnr(model, vid, device, batch_size=8, debug_psnr=False):
+def measure_decode_fps(model, num_frames, device, batch_size=8, repeats=20):
+    model.eval()
+    times = torch.linspace(0.0, 1.0, steps=num_frames, device=device, dtype=torch.float32)
+    use_cuda = 'cuda' in device
+    if use_cuda:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+    with torch.no_grad():
+        for _ in range(10):
+            for start_idx in range(0, num_frames, batch_size):
+                end_idx = min(num_frames, start_idx + batch_size)
+                _ = model(times[start_idx:end_idx])
+
+    if use_cuda:
+        torch.cuda.synchronize(device)
+    start = time.perf_counter()
+
+    with torch.no_grad():
+        for _ in range(repeats):
+            for start_idx in range(0, num_frames, batch_size):
+                end_idx = min(num_frames, start_idx + batch_size)
+                _ = model(times[start_idx:end_idx])
+
+    if use_cuda:
+        torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - start
+    return float(num_frames * repeats) / elapsed
+
+
+def measure_psnr(model, vid, device, batch_size=8, debug_psnr=False):
     model.eval()
     num_frames = vid.shape[0]
     total_psnr = 0.0
     total_frames = 0
 
-    if 'cuda' in device:
-        torch.cuda.synchronize(device)
-    start = time.time()
     with torch.no_grad():
         for start_idx in range(0, num_frames, batch_size):
             end_idx = min(num_frames, start_idx + batch_size)
@@ -135,43 +155,53 @@ def measure_decode_and_psnr(model, vid, device, batch_size=8, debug_psnr=False):
                     print(f"frame {idx}: psnr={psnr_value:.6f}")
             total_psnr += frame_psnr.sum().item()
             total_frames += frame_psnr.shape[0]
-    if 'cuda' in device:
-        torch.cuda.synchronize(device)
-    elapsed = time.time() - start
-    decode_fps = float(num_frames) / elapsed if elapsed > 0 else float('inf')
 
     avg_psnr = total_psnr / total_frames if total_frames > 0 else 0.0
-    return decode_fps, float(avg_psnr)
+    return float(avg_psnr)
 
 
 def measure_encode_fps(model, vid, device, steps=5, n_frames=20):
     model.train()
     n_frames = min(n_frames, vid.shape[0])
-    norm_t = torch.arange(n_frames, device=device, dtype=torch.float32) / max(n_frames - 1, 1)
-    target = vid[:n_frames].to(torch.float32) / 255.0
+    idx = torch.arange(n_frames, device=device)
+    norm_t = idx.float() / max(vid.shape[0] - 1, 1)
+    target = vid[idx].to(torch.float32) / 255.0
     opt = SOAP(model.parameters(), lr=1e-2)
 
-    if 'cuda' in device:
+    use_cuda = 'cuda' in device
+    if use_cuda:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+    if use_cuda:
         torch.cuda.synchronize(device)
+
     for _ in range(5):
         opt.zero_grad(set_to_none=True)
         pred = model(norm_t)
         loss = F.mse_loss(pred, target)
         loss.backward()
         opt.step()
-    if 'cuda' in device:
-        torch.cuda.synchronize(device)
 
-    start = time.time()
+    if use_cuda:
+        torch.cuda.synchronize(device)
+        start_event.record()
+    else:
+        start_time = time.perf_counter()
+
     for _ in range(steps):
         opt.zero_grad(set_to_none=True)
         pred = model(norm_t)
         loss = F.mse_loss(pred, target)
         loss.backward()
         opt.step()
-    if 'cuda' in device:
+
+    if use_cuda:
+        end_event.record()
         torch.cuda.synchronize(device)
-    elapsed = time.time() - start
+        elapsed = start_event.elapsed_time(end_event) * 1e-3
+    else:
+        elapsed = time.perf_counter() - start_time
     return float((n_frames * steps) / elapsed) if elapsed > 0 else float('inf')
 
 
@@ -209,7 +239,8 @@ def main():
         print(f"Warning: torch.compile failed, running uncompiled model: {exc}")
 
     warmup_model(model, vid.shape[0], device, batch_size=args.batch_size)
-    decode_fps, psnr = measure_decode_and_psnr(model, vid, device, batch_size=args.batch_size, debug_psnr=args.debug_psnr)
+    decode_fps = measure_decode_fps(model, vid.shape[0], device, batch_size=args.batch_size)
+    psnr = measure_psnr(model, vid, device, batch_size=args.batch_size, debug_psnr=args.debug_psnr)
     encode_fps = measure_encode_fps(model, vid, device)
 
     print(f"Decode FPS: {decode_fps:.2f}")

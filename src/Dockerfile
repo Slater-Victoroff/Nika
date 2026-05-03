@@ -17,9 +17,11 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install numpy \
-                torch \
-                torchvision \
+RUN pip install --no-cache-dir \
+    torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+RUN pip install --no-cache-dir \
+                numpy \
                 pillow \
                 scikit-image \
                 piq \
